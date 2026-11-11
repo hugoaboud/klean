@@ -50,15 +50,20 @@ Interaction, on either board:
 - drag a node, or a group's **header bar**, to move it; drag the background for a
   rubber-band selection (the tree supports the same rectangle); ctrl/cmd + drag to pan;
   wheel to zoom
-- a click selects, ctrl/cmd + click adds to the selection, and only a **double click**
-  opens the editor modal — a single click updates an open modal only when exactly one item
-  is selected
+- a click selects, ctrl/cmd **or shift** + click adds to the selection, and only a **double
+  click** opens the editor modal — a single click updates an open modal only when exactly
+  one item is selected. Shift works the same way with the rubber band: the rectangle adds
+  what it touches to the selection instead of replacing it
 - the modal marks every diagnostic line with an icon in the gutter and a soft line wash,
   lists only the diagnostics that fall inside the node, and offers a comments box that
   writes plain `--` comments back above the declaration
-- the right-hand column of the modal is what Lean says about the node: the **proof state**
-  (the goals left at the caret, asked of Lean's language server) and the **diagnostics**
-  inside the node, worst first
+- the right-hand column of the modal is what Lean says about the node, with syntax
+  highlighting and a divider you can drag to give either side more room: the **term** under
+  the caret (`textDocument/hover`), the **proof state** (the goals left at the caret from
+  `$/lean/plainGoal`) and the **diagnostics** inside the node, worst first
+- a node's **comments** are the `--` lines sitting directly above it — a blank line ends the
+  note, and block comments are prose, not a note. KLEAN writes them back as `--` lines,
+  wrapped at 200 characters
 - `.klean.json` is the project file: graph positions, the camera of each board, hidden
   logic items and the project settings. Writes are batched — dragging updates memory and
   the file is rewritten at most every five seconds (and whenever the project is switched)

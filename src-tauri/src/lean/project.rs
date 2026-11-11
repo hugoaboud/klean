@@ -64,12 +64,19 @@ pub struct CachedFile {
 }
 
 impl CachedFile {
-    /// The diagnostics Lean last reported for this file.
+    /// Everything wrong with this file: what parsing itself reported (a missing
+    /// toolchain, a file that could not be read) followed by Lean's own
+    /// diagnostics, which the server publishes while the file sits open.
     pub fn diagnostics(&self) -> Vec<Diagnostic> {
-        self.diagnostics
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        let mut out = self.parsed.diagnostics.clone();
+        out.extend(
+            self.diagnostics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .cloned(),
+        );
+        out
     }
 }
 
@@ -202,6 +209,37 @@ impl Project {
     /// Installs the callback that streams build output to the frontend.
     pub fn set_build_sink(&mut self, sink: std::sync::Arc<dyn Fn(&str) + Send + Sync>) {
         self.engine.set_build_sink(sink);
+    }
+
+    /// The type of the term at a position inside a node.
+    pub fn lean_hover(
+        &mut self,
+        id: &str,
+        line: Option<u32>,
+        character: Option<u32>,
+    ) -> LeanResult<Option<String>> {
+        let (rel, default_line) = match self.resolve(id)? {
+            Target::Ast { rel, path } => {
+                let cached = self.load(&rel, Parse::Exact)?;
+                let node = cached
+                    .parsed
+                    .get(&path)
+                    .ok_or_else(|| LeanError::msg(format!("node `{id}` no longer exists")))?;
+                let line = cached.lines.line_of(node.inner.end);
+                (rel, line)
+            }
+            Target::File(rel) | Target::AstGroup(rel) => (rel, 1),
+            _ => return Err(LeanError::msg("only files and declarations have terms")),
+        };
+        let cached = self.load(&rel, Parse::Exact)?;
+        let source = cached.source.clone();
+        let absolute = self
+            .fs
+            .absolute(&rel)
+            .ok_or_else(|| LeanError::msg("Lean needs a folder project"))?;
+        drop(cached);
+        self.engine
+            .hover(&absolute, &source, line.unwrap_or(default_line), character.unwrap_or(0))
     }
 
     /// Proof goals at a position inside a node, from Lean's language server.
@@ -875,6 +913,7 @@ impl Project {
         match self.resolve(id)? {
             Target::Ast { rel, path } => {
                 let cached = self.load(&rel, Parse::Exact)?;
+
                 let node = cached
                     .parsed
                     .get(&path)
@@ -897,17 +936,7 @@ impl Project {
                     doc: node.doc.clone(),
                     comments: node.comments.as_deref().map(bare_comment),
                     signature: node.signature.clone(),
-                    diagnostics: diagnostics_of(
-                        &cached
-                            .parsed
-                            .diagnostics
-                            .iter()
-                            .filter(|diagnostic| {
-                                diagnostic.line >= start_line && diagnostic.line <= end_line
-                            })
-                            .cloned()
-                            .collect::<Vec<_>>(),
-                    ),
+                    diagnostics: diagnostics_of(&node_diagnostics(&cached, start_line, end_line)),
                 })
             }
             Target::File(rel) | Target::AstGroup(rel) => {
@@ -989,6 +1018,7 @@ impl Project {
         let (rel, span) = match self.resolve(id)? {
             Target::Ast { rel, path } => {
                 let cached = self.load(&rel, Parse::Exact)?;
+
                 let node = cached
                     .parsed
                     .get(&path)
@@ -1017,6 +1047,7 @@ impl Project {
         let (rel, comment_span, node_start, indent, region_start) = match self.resolve(id)? {
             Target::Ast { rel, path } => {
                 let cached = self.load(&rel, Parse::Exact)?;
+
                 let node = cached
                     .parsed
                     .get(&path)
@@ -1036,18 +1067,21 @@ impl Project {
         let _ = comment_span;
 
         let source = self.fs.read(&rel)?;
+        // Notes are written as `--` lines, one per line, wrapped so that no line
+        // runs past the width a comment stays readable at. Markers pasted in are
+        // stripped first, since the editor edits plain text.
         let mut block = String::new();
         for line in text.lines() {
-            // The editor edits plain text; markers are added here, and are
-            // stripped again if they were pasted in.
             let line = strip_comment_marker(line.trim());
             if line.is_empty() {
                 continue;
             }
-            block.push_str(&indent);
-            block.push_str("-- ");
-            block.push_str(line);
-            block.push('\n');
+            for chunk in wrap_comment(line, COMMENT_WIDTH) {
+                block.push_str(&indent);
+                block.push_str("-- ");
+                block.push_str(&chunk);
+                block.push('\n');
+            }
         }
         let replacement = format!("{block}{indent}");
         if region_start > node_start {
@@ -1503,6 +1537,41 @@ impl Project {
 
 // ------------------------------------------------------------------- helpers
 
+/// Longest line a written `--` comment may run to.
+const COMMENT_WIDTH: usize = 200;
+
+/// Breaks one comment line into pieces of at most `width` characters, at word
+/// boundaries where possible.
+fn wrap_comment(line: &str, width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in line.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.chars().count() + 1 + word.chars().count() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+        // A single very long word is cut rather than left to overflow.
+        while current.chars().count() > width {
+            let head: String = current.chars().take(width).collect();
+            let tail: String = current.chars().skip(width).collect();
+            out.push(head);
+            current = tail;
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 /// Drops the Lean comment markers from one line, so the editor shows text only.
 fn strip_comment_marker(line: &str) -> &str {
     let trimmed = line.trim();
@@ -1709,6 +1778,15 @@ fn splice(source: &str, span: Span, text: &str) -> LeanResult<String> {
     out.push_str(text);
     out.push_str(&source[end..]);
     Ok(out)
+}
+
+/// The diagnostics that fall inside a node's lines.
+fn node_diagnostics(cached: &CachedFile, start_line: u32, end_line: u32) -> Vec<Diagnostic> {
+    cached
+        .diagnostics()
+        .into_iter()
+        .filter(|diagnostic| diagnostic.line >= start_line && diagnostic.line <= end_line)
+        .collect()
 }
 
 fn diagnostics_of(diagnostics: &[Diagnostic]) -> Vec<DiagnosticDto> {
@@ -2331,5 +2409,165 @@ theorem todo : two = 3 := by sorry
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+
+    /// A project of its own per test: tests run in parallel, and sharing one
+    /// directory means one wiping the files the other's server is reading.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("klean-test-editor-{name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Demo")).expect("project dir");
+        std::fs::write(
+            root.join("lakefile.toml"),
+            "name = \"demo\"\n\n[[lean_lib]]\nname = \"Demo\"\n",
+        )
+        .expect("lakefile");
+        std::fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.36.0-rc2\n")
+            .expect("toolchain");
+        std::fs::write(root.join("Demo.lean"), "import Demo.Basic\n").expect("root module");
+        std::fs::write(
+            root.join("Demo/Basic.lean"),
+            "def two : Nat := 2\n\ntheorem t : two = 2 := rfl\n",
+        )
+        .expect("module");
+        root
+    }
+
+    fn settle(project: &mut Project) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        while project.lean_processing() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    /// Typing a term Lean does not know has to show up as an error in the editor.
+    #[test]
+    fn a_broken_edit_reports_lean_errors() {
+        let root = scratch("errors");
+        let mut project = match Project::open(&root, std::env::temp_dir().join("klean-test-appdata")) {
+            Ok(project) => project,
+            Err(error) => {
+                eprintln!("cannot open the project without Lean: {error}");
+                return;
+            }
+        };
+        project.view().expect("view");
+        project.check_file("Demo/Basic.lean").expect("check");
+        settle(&mut project);
+
+        let def = project
+            .view()
+            .expect("view")
+            .tree
+            .first()
+            .and_then(|lib| find(lib, "Demo/Basic.lean"))
+            .and_then(|file| file.children.first().cloned())
+            .map(|node| node.id)
+            .expect("the definition");
+        let good = project.detail(&def).expect("detail");
+        assert!(
+            good.diagnostics.iter().all(|diagnostic| diagnostic.severity != "error"),
+            "the pristine file has no errors: {:?}",
+            good.diagnostics
+        );
+
+        // Now use a term that does not exist.
+        project
+            .update(&def, "def two : Nat := missingTerm")
+            .expect("update");
+        settle(&mut project);
+
+        let broken = project.detail(&def).expect("detail");
+        assert!(
+            broken
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == "error"),
+            "Lean's error has to reach the editor: {:?}",
+            broken.diagnostics
+        );
+    }
+
+    /// The type of the term at the caret comes from Lean's `textDocument/hover`.
+    #[test]
+    fn hovering_a_term_reports_its_type() {
+        let root = scratch("hover");
+        let mut project = match Project::open(&root, std::env::temp_dir().join("klean-test-appdata")) {
+            Ok(project) => project,
+            Err(error) => {
+                eprintln!("cannot open the project without Lean: {error}");
+                return;
+            }
+        };
+        project.view().expect("view");
+        project.check_file("Demo/Basic.lean").expect("check");
+        settle(&mut project);
+        let def = find(&project.view().expect("view").tree[0], "Demo/Basic.lean")
+            .and_then(|file| file.children.first().cloned())
+            .map(|node| node.id)
+            .expect("the definition");
+
+        // `two` sits on line 1, columns 4..7 of `def two : Nat := 2`. The server
+        // answers once it has processed the file, which on a busy machine can take
+        // a moment, so the request is repeated until it does.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut text = None;
+        while std::time::Instant::now() < deadline {
+            text = project.lean_hover(&def, Some(1), Some(5)).expect("hover");
+            if text.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        let text = text.expect("Lean knows what `two` is");
+        assert!(text.contains("two") || text.contains("Nat"), "{text:?}");
+    }
+
+    /// Notes are written as `--` lines and wrapped at 200 characters.
+    #[test]
+    fn long_notes_are_written_as_several_comment_lines() {
+        let root = scratch("notes");
+        let mut project = Project::open(&root, std::env::temp_dir().join("klean-test-appdata"))
+            .expect("project");
+        project.view().expect("view");
+        let def = find(&project.view().expect("view").tree[0], "Demo/Basic.lean")
+            .and_then(|file| file.children.first().cloned())
+            .map(|node| node.id)
+            .expect("the definition");
+
+        let long: String = std::iter::repeat("word ").take(80).collect();
+        project.update_comments(&def, &long).expect("comments");
+
+        let source = std::fs::read_to_string(root.join("Demo/Basic.lean")).expect("file");
+        let comment_lines: Vec<&str> = source
+            .lines()
+            .filter(|line| line.trim_start().starts_with("--"))
+            .collect();
+        assert!(comment_lines.len() > 1, "a long note is wrapped: {comment_lines:?}");
+        for line in &comment_lines {
+            assert!(
+                line.chars().count() <= 200 + 3,
+                "comment line is too long: {} chars",
+                line.chars().count()
+            );
+            assert!(line.trim_start().starts_with("-- "), "{line}");
+        }
+        // And it reads back as one note.
+        let detail = project.detail(&def).expect("detail");
+        assert!(detail.comments.unwrap_or_default().contains("word word"));
+    }
+
+    fn find<'a>(node: &'a TreeNode, rel: &str) -> Option<&'a TreeNode> {
+        if node.kind == "file" && node.path.as_deref() == Some(rel) {
+            return Some(node);
+        }
+        node.children.iter().find_map(|child| find(child, rel))
     }
 }

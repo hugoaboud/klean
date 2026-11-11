@@ -6,6 +6,7 @@
 // Edits are flushed to Rust with a short debounce, and Ctrl/Cmd+S flushes now;
 // each flush re-checks the file through the Lean toolchain.
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import hljs from "../lib/highlight";
 import type { Goals, NodeDetail } from "../api/lean";
 import UiButton from "./ui/UiButton.vue";
 import UiCodeEditor from "./ui/UiCodeEditor.vue";
@@ -21,6 +22,9 @@ const props = defineProps<{
   goalsBusy: boolean;
   /** True while Lean is still checking this file. */
   processing?: boolean;
+  /** The type of the term at the caret, as Lean renders it. */
+  term?: string | null;
+  termBusy?: boolean;
   /** The prompt row only exists when AI features are switched on. */
   aiEnabled?: boolean;
 }>();
@@ -83,6 +87,53 @@ const diagnostics = computed(() => {
 });
 
 const goalLines = computed(() => props.goals?.goals ?? []);
+
+/** Lean snippets in the state panel, coloured with the editor's own grammar. */
+function highlighted(code: string): string {
+  try {
+    return hljs.highlight(code, { language: "lean", ignoreIllegals: true }).value;
+  } catch {
+    return code.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+}
+
+/** The term of the caret as a code block, without Lean's markdown fences. */
+const termCode = computed(() => {
+  const text = props.term ?? "";
+  return text
+    .replace(/```[a-zA-Z]*\n?/g, "")
+    .split("\n")
+    .map((line) => line.replace(/^\s{2,}/, (indent) => indent.length >= 2 ? "" : indent))
+    .join("\n")
+    .trim();
+});
+
+/**
+ * The width of the state column, dragged by the divider. Kept in the component:
+ * it is view state, and the modal remembers it for as long as it is open.
+ */
+const sideWidth = ref(230);
+let dragStart: { x: number; width: number } | null = null;
+
+function startDrag(event: PointerEvent) {
+  dragStart = { x: event.clientX, width: sideWidth.value };
+  (event.target as HTMLElement).setPointerCapture(event.pointerId);
+  event.preventDefault();
+}
+
+function onDrag(event: PointerEvent) {
+  if (!dragStart) return;
+  // Dragging left widens the state column, and it never eats the code editor.
+  const next = dragStart.width - (event.clientX - dragStart.x);
+  const room = window.innerWidth * 0.6;
+  sideWidth.value = Math.max(160, Math.min(room, next));
+}
+
+function endDrag(event: PointerEvent) {
+  if (!dragStart) return;
+  dragStart = null;
+  (event.target as HTMLElement).releasePointerCapture(event.pointerId);
+}
 
 watch(
   () => props.detail?.id,
@@ -255,16 +306,45 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <aside class="node-editor__side">
+      <div
+        class="node-editor__divider"
+        title="Drag to resize the state panel"
+        role="separator"
+        aria-orientation="vertical"
+        @pointerdown="startDrag"
+        @pointermove="onDrag"
+        @pointerup="endDrag"
+        @pointercancel="endDrag"
+      />
+
+      <aside class="node-editor__side" :style="{ width: `${sideWidth}px` }">
+        <div class="node-editor__section">
+          <span class="k-label">
+            term
+            <UiSpinner v-if="termBusy" :size="9" />
+          </span>
+          <pre
+            v-if="termCode"
+            class="node-editor__goal hljs"
+            v-html="highlighted(termCode)"
+          />
+          <p v-else class="node-editor__hint">
+            put the caret on a term to see what Lean makes of it
+          </p>
+        </div>
+
         <div class="node-editor__section">
           <span class="k-label">
             proof state
             <UiSpinner v-if="goalsBusy" :size="9" />
           </span>
           <div v-if="goalLines.length" class="node-editor__goals">
-            <pre v-for="(goal, index) in goalLines" :key="index" class="node-editor__goal">{{
-              goal
-            }}</pre>
+            <pre
+              v-for="(goal, index) in goalLines"
+              :key="index"
+              class="node-editor__goal hljs"
+              v-html="highlighted(goal)"
+            />
           </div>
           <p v-else class="node-editor__hint">
             {{ goals?.note ?? "move the caret into the proof to see the goals" }}
@@ -326,7 +406,7 @@ onBeforeUnmount(() => {
   display: flex;
   flex: 1;
   min-height: 0;
-  gap: 10px;
+  gap: 4px;
 }
 
 .node-editor__main {
@@ -338,13 +418,25 @@ onBeforeUnmount(() => {
   gap: 8px;
 }
 
+.node-editor__divider {
+  width: 7px;
+  flex: 0 0 auto;
+  cursor: col-resize;
+  border-radius: 3px;
+  background: transparent;
+  transition: background-color var(--t) var(--ease);
+}
+
+.node-editor__divider:hover {
+  background: var(--accent-soft, rgba(120, 160, 210, 0.16));
+}
+
 .node-editor__side {
   display: flex;
   flex-direction: column;
-  width: 230px;
-  min-width: 140px;
+  min-width: 160px;
   gap: 8px;
-  padding-left: 10px;
+  padding-left: 8px;
   border-left: 1px solid var(--line);
   overflow: auto;
 }

@@ -74,6 +74,7 @@ pub fn run() {
             commands::lean_build_cancel,
             commands::lean_check_file,
             commands::lean_goals,
+            commands::lean_hover,
             commands::lean_install,
         ])
         .run(tauri::generate_context!())

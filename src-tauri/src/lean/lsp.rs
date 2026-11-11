@@ -61,6 +61,13 @@ enum Task {
         character: u32,
         reply: Sender<Result<Goals, String>>,
     },
+    Hover {
+        path: PathBuf,
+        text: String,
+        line: u32,
+        character: u32,
+        reply: Sender<Result<Option<String>, String>>,
+    },
     Stop,
 }
 
@@ -161,6 +168,32 @@ impl Client {
         }
     }
 
+    /// The type of the term at a position, as Lean renders it.
+    pub fn hover(
+        &self,
+        path: &Path,
+        text: &str,
+        line: u32,
+        character: u32,
+        timeout: Duration,
+    ) -> LeanResult<Option<String>> {
+        let (reply, answer) = mpsc::channel();
+        self.sender
+            .send(Task::Hover {
+                path: path.to_path_buf(),
+                text: text.to_string(),
+                line,
+                character,
+                reply,
+            })
+            .map_err(|_| LeanError::msg("the Lean worker is not running"))?;
+        match answer.recv_timeout(timeout) {
+            Ok(Ok(hover)) => Ok(hover),
+            Ok(Err(message)) => Err(LeanError::msg(message)),
+            Err(_) => Err(LeanError::msg("the Lean server did not answer in time")),
+        }
+    }
+
     pub fn stop(&self) {
         let _ = self.sender.send(Task::Stop);
     }
@@ -197,6 +230,19 @@ fn worker(
                     *failure.lock().expect("failure lock") = Some(error.to_string());
                 }
             }
+            Ok(Task::Hover {
+                path,
+                text,
+                line,
+                character,
+                reply,
+            }) => {
+                let result = session
+                    .sync(&path, &text)
+                    .and_then(|_| session.hover(&path, line, character))
+                    .map_err(|error| error.to_string());
+                let _ = reply.send(result);
+            }
             Ok(Task::Goals {
                 path,
                 text,
@@ -230,6 +276,10 @@ fn worker(
 struct Document {
     version: i64,
     text: String,
+    /// The version the last published diagnostics describe. Lean publishes
+    /// *after* it reports itself idle, so this is what tells the UI whether what
+    /// it would read is the answer to the text it sent.
+    diagnostics_version: Option<i64>,
 }
 
 /// A running server process.
@@ -316,7 +366,11 @@ impl Session {
             None => {
                 self.documents.insert(
                     uri.clone(),
-                    Document { version: 1, text: text.to_string() },
+                    Document {
+                        version: 1,
+                        text: text.to_string(),
+                        diagnostics_version: None,
+                    },
                 );
                 self.notify(
                     "textDocument/didOpen",
@@ -337,6 +391,8 @@ impl Session {
                 let change = diff(&document.text, text);
                 document.version += 1;
                 document.text = text.to_string();
+                // The answer for the old text is now stale.
+                document.diagnostics_version = None;
                 let version = document.version;
                 self.notify(
                     "textDocument/didChange",
@@ -377,9 +433,13 @@ impl Session {
         let mut snapshot = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         snapshot.open = self.documents.len();
         snapshot.processing = self
-            .processing
+            .documents
             .iter()
-            .filter(|(_, count)| **count > 0)
+            .filter(|(uri, document)| {
+                let busy = self.processing.get(*uri).is_some_and(|count| *count > 0);
+                let answered = document.diagnostics_version == Some(document.version);
+                busy || !answered
+            })
             .map(|(uri, _)| relative_of(root, uri))
             .collect();
         snapshot.diagnostics = self
@@ -389,10 +449,9 @@ impl Session {
             .collect();
         if std::env::var_os("KLEAN_DEBUG").is_some() {
             eprintln!(
-                "lsp: documents={:?} diagnostics={:?} processing={:?}",
-                self.documents.keys().collect::<Vec<_>>(),
-                self.diagnostics.keys().collect::<Vec<_>>(),
-                self.processing
+                "lsp: root={:?} diagnostic keys={:?}",
+                root,
+                snapshot.diagnostics.keys().collect::<Vec<_>>()
             );
         }
         Ok(())
@@ -428,6 +487,12 @@ impl Session {
         let Some(uri) = params.get("uri").and_then(Value::as_str) else {
             return;
         };
+        let version = params.get("version").and_then(Value::as_i64);
+        if let Some(document) = self.documents.get_mut(uri) {
+            // `null` version means the server is not talking about a specific
+            // revision; treat it as current rather than waiting forever.
+            document.diagnostics_version = Some(version.unwrap_or(document.version));
+        }
         let mut diagnostics = Vec::new();
         if let Some(list) = params.get("diagnostics").and_then(Value::as_array) {
             for entry in list {
@@ -481,6 +546,45 @@ impl Session {
             .map(|entries| entries.len())
             .unwrap_or(0);
         self.processing.insert(uri.to_string(), count);
+    }
+
+    /// The term under the caret: `textDocument/hover`, as plain text.
+    fn hover(&mut self, path: &Path, line: u32, character: u32) -> LeanResult<Option<String>> {
+        let uri = uri_of(path);
+        let result = self.request(
+            "textDocument/hover",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line.saturating_sub(1), "character": character }
+            }),
+        )?;
+        if result.is_null() {
+            return Ok(None);
+        }
+        // `MarkupContent` or `MarkedString | MarkedString[]`.
+        let contents = result.get("contents").cloned().unwrap_or(Value::Null);
+        let text = match contents {
+            Value::String(text) => text,
+            Value::Object(object) => match object.get("value") {
+                Some(Value::String(text)) => text.clone(),
+                _ => return Ok(None),
+            },
+            Value::Array(items) => items
+                .iter()
+                .filter_map(|item| match item {
+                    Value::String(text) => Some(text.clone()),
+                    Value::Object(object) => object
+                        .get("value")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => return Ok(None),
+        };
+        let text = text.trim().to_string();
+        Ok((!text.is_empty()).then_some(text))
     }
 
     /// `$/lean/plainGoal` at a position (1-based line, 0-based UTF-16 column).

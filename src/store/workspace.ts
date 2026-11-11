@@ -46,6 +46,9 @@ interface State {
   /** Goals of the node open in the editor, from Lean's language server. */
   goals: api.Goals | null;
   goalsBusy: boolean;
+  /** The type of the term at the caret, as Lean renders it. */
+  term: string | null;
+  termBusy: boolean;
   /** Last line the toolchain installer printed. */
   install: string | null;
   /** The `lake build` console (empty until a build is started). */
@@ -83,6 +86,8 @@ export const state = reactive<State>({
   lean: null,
   goals: null,
   goalsBusy: false,
+  term: null,
+  termBusy: false,
   install: null,
   build: null,
   buildOpen: false,
@@ -234,6 +239,23 @@ function settingValue(id: string, fallback: string): string {
  * Goals for the node in the editor at `line`/`character`, both relative to the
  * node's own text. Without a position, the end of the declaration is asked.
  */
+/** Asks Lean what the term under the caret is. */
+async function loadTerm(line?: number, character?: number) {
+  const id = state.detail?.id;
+  if (!id) {
+    state.term = null;
+    return;
+  }
+  state.termBusy = true;
+  try {
+    state.term = await api.leanHover(id, line, character);
+  } catch {
+    state.term = null;
+  } finally {
+    state.termBusy = false;
+  }
+}
+
 async function loadGoals(line?: number, character?: number) {
   const id = state.detail?.id;
   if (!id) {
@@ -564,8 +586,10 @@ export const actions = {
     if (!DETAILABLE.test(id)) return;
     state.editorOpen = true;
     state.goals = null;
+    state.term = null;
     await loadDetail(id);
     void loadGoals();
+    void loadTerm();
     // Only the file the user opened is checked, never the whole project.
     void api.leanCheckFile(id).then(() => pollProcessing()).catch(() => {});
   },
@@ -612,6 +636,11 @@ export const actions = {
   /** Goals at a position in the open node. */
   async loadGoals(line?: number, character?: number) {
     await loadGoals(line, character);
+  },
+
+  /** The term at a position in the open node. */
+  async loadTerm(line?: number, character?: number) {
+    await loadTerm(line, character);
   },
 
   /** Installs Lean through the app, reporting progress as it goes. */
@@ -814,6 +843,7 @@ export const actions = {
     state.editorOpen = false;
     state.saveError = null;
     state.goals = null;
+    state.term = null;
   },
 
   async toggleGraph(id: string) {

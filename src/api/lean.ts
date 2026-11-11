@@ -355,6 +355,10 @@ export const leanCheckFile = (id: string) => invoke<void>("lean_check_file", { i
 export const leanGoals = (id: string, line?: number, character?: number) =>
   invoke<Goals>("lean_goals", { id, line: line ?? null, character: character ?? null });
 
+/** The type of the term at a position, as Lean renders it. */
+export const leanHover = (id: string, line?: number, character?: number) =>
+  invoke<string | null>("lean_hover", { id, line: line ?? null, character: character ?? null });
+
 /** Downloads elan + the configured channel; resolves with the `lean` path. */
 export const leanInstall = () => invoke<string>("lean_install");
 

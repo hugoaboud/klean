@@ -267,57 +267,69 @@ textarea {
   outline-offset: 1px;
 }
 
-/* Syntax highlighting (highlight.js theme, matched to the palette) --------- */
+/* Syntax highlighting (highlight.js theme) ---------------------------------
+   One Dark-ish and deliberately colourful: Lean is read for its structure, so
+   keywords, types, definitions, strings and numbers each get a colour of their
+   own instead of shades of grey. */
 
 .hljs-comment,
 .hljs-quote {
-  color: #5c666c;
+  color: #6b7a86;
   font-style: italic;
 }
 
 .hljs-keyword,
 .hljs-selector-tag,
 .hljs-literal {
-  color: #8fa6c0;
+  color: #c678dd;
 }
 
 .hljs-built_in,
 .hljs-type {
-  color: #c9a96b;
+  color: #e5c07b;
 }
 
 .hljs-name,
 .hljs-title,
 .hljs-function .hljs-title {
-  color: #a8c8b4;
+  color: #61afef;
+  font-weight: 600;
 }
 
 .hljs-string,
 .hljs-meta .hljs-string {
-  color: #9fb08a;
+  color: #98c379;
 }
 
 .hljs-number {
-  color: #c2a08a;
+  color: #d19a66;
 }
 
-.hljs-symbol,
+.hljs-symbol {
+  color: #56b6c2;
+}
+
 .hljs-operator {
-  color: #9aa6ae;
+  color: #56b6c2;
 }
 
 .hljs-attr,
 .hljs-attribute {
-  color: #c58e7a;
+  color: #e06c75;
 }
 
 .hljs-meta {
-  color: #7e8b93;
+  color: #d19a66;
 }
 
 .hljs-variable,
 .hljs-params {
-  color: var(--text);
+  color: #e8eef2;
+}
+
+.hljs-doctag {
+  color: #c678dd;
+  font-weight: 600;
 }
 
 .hljs-section,

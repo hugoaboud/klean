@@ -619,12 +619,13 @@ fn decorate_children(source: &str, node: &mut AstNode) {
     }
 }
 
-/// The block of comment lines at the end of `region`, with its span.
+/// The `--` comments that belong to a node, with the span they cover.
 ///
-/// Lean's syntax tree does not carry comments, so they are recovered by walking
-/// up from the node: contiguous `--` lines and `/- … -/` blocks, blank lines in
-/// between allowed. A doc comment (`/--`, `/-!`) belongs to the node itself, so
-/// hitting one ends the walk.
+/// Only line comments count, and only when they sit *directly* above the node: a
+/// blank line between the comments and the declaration means they belong to
+/// whatever comes next, not to this node. Block comments (`/- … -/`) are treated
+/// as prose, not as this node's note, which is also why KLEAN writes notes back
+/// as `--` lines.
 fn trailing_comments(source: &str, region: Span) -> Option<(String, Span)> {
     let text = slice(source, region);
     if text.trim().is_empty() {
@@ -637,64 +638,27 @@ fn trailing_comments(source: &str, region: Span) -> Option<(String, Span)> {
         offset += line.len() as u32;
     }
 
+    // Walk up from the node. The first line has to be a comment: anything else
+    // (a blank line included) means the node has no note of its own.
     let mut collected: Vec<usize> = Vec::new();
-    let mut blanks: Vec<usize> = Vec::new();
-    // Index of the line that closed the block comment being scanned, if any.
-    let mut block_close: Option<usize> = None;
     for index in (0..offsets.len()).rev() {
         let line = offsets[index].1.trim();
-        if let Some(close) = block_close {
-            // Inside `/- … -/`: keep going up to the opening line.
-            if line.starts_with("/-") {
-                block_close = None;
-                if line.starts_with("/--") || line.starts_with("/-!") {
-                    // A doc comment: it belongs to the node, so the lines it
-                    // covers are dropped and the walk stops.
-                    collected.retain(|held| *held > close);
-                    break;
-                }
-            }
-            collected.push(index);
-            continue;
-        }
         if line.is_empty() {
             if collected.is_empty() {
-                continue;
+                // A blank line right above the node: no comment belongs to it.
+                return None;
             }
-            blanks.push(index);
-            continue;
+            break;
         }
-        if line.ends_with("-/") {
-            if line.starts_with("/--") || line.starts_with("/-!") {
-                break;
-            }
-            collected.append(&mut blanks);
-            collected.push(index);
-            if !line.starts_with("/-") {
-                // The closing line of a multi-line block comment.
-                block_close = Some(index);
-            }
-            continue;
+        if !line.starts_with("--") {
+            break;
         }
-        if line.starts_with("--") {
-            collected.append(&mut blanks);
-            collected.push(index);
-            continue;
-        }
-        break;
+        collected.push(index);
     }
     if collected.is_empty() {
         return None;
     }
     collected.reverse();
-    // Blank lines that were waiting between comments never start the block.
-    while let Some(&index) = collected.first() {
-        if offsets[index].1.trim().is_empty() {
-            collected.remove(0);
-        } else {
-            break;
-        }
-    }
     let first = *collected.first()?;
     let last = *collected.last()?;
     let raw: String = offsets[first..=last].iter().map(|(_, line)| *line).collect();
@@ -976,6 +940,30 @@ mod tests {
         assert_eq!(node.comments.as_deref(), Some("a note"));
         let span = node.comment_span.expect("comment span");
         assert_eq!(slice(source, span), "-- a note");
+    }
+
+    #[test]
+    fn a_blank_line_breaks_the_note() {
+        let source = "#check Nat\n\n-- a note\n\ndef foo : Nat := 1\n";
+        let start = source.find("def foo").unwrap() as u32;
+        let parsed = build(source, &file(vec![definition(start, start + 18)]));
+        assert_eq!(parsed.nodes[0].comments, None, "the note belongs to nothing");
+    }
+
+    #[test]
+    fn block_comments_are_not_notes() {
+        let source = "#check Nat\n\n/- a block -/\ndef foo : Nat := 1\n";
+        let start = source.find("def foo").unwrap() as u32;
+        let parsed = build(source, &file(vec![definition(start, start + 18)]));
+        assert_eq!(parsed.nodes[0].comments, None);
+    }
+
+    #[test]
+    fn a_note_may_span_several_lines() {
+        let source = "#check Nat\n\n-- first\n-- second\ndef foo : Nat := 1\n";
+        let start = source.find("def foo").unwrap() as u32;
+        let parsed = build(source, &file(vec![definition(start, start + 18)]));
+        assert_eq!(parsed.nodes[0].comments.as_deref(), Some("first\nsecond"));
     }
 
     #[test]

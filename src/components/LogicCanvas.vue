@@ -605,8 +605,17 @@ function startDrag(node: SimNode, event: PointerEvent) {
   if (!origin) return;
   dragStart = origin;
   beforeDrag = new Map(currentNodes.map((entry) => [entry.id, [entry.x, entry.y] as const]));
-  dragNodes = [{ node, x: node.x, y: node.y }];
+  // Dragging a node that is part of a selection drags the whole selection, which
+  // is also what a drop on a theory moves.
+  const selected = new Set(props.selectedIds);
+  const group = selected.has(node.id) && selected.size > 1
+    ? currentNodes.filter((entry) => selected.has(entry.id))
+    : [node];
+  dragNodes = group.map((entry) => ({ node: entry, x: entry.x, y: entry.y }));
   nodeLayer?.selectAll("g.logic-node").raise();
+  // A term can be dragged onto a theory node to join it.
+  const movable = node.kind !== "theory";
+  const assignable = group.filter((entry) => entry.kind !== "theory").map((entry) => entry.id);
 
   const move = (moveEvent: PointerEvent) => {
     const point = pointerInGraph(moveEvent);
@@ -617,15 +626,56 @@ function startDrag(node: SimNode, event: PointerEvent) {
       entry.node.x = entry.x + dx;
       entry.node.y = entry.y + dy;
     }
+    if (movable && assignable.length > 0) {
+      const hit = theoryAt(point, node.id);
+      const key = hit?.key ?? null;
+      if (key !== dropTheory.value) {
+        dropTheory.value = key;
+        draw();
+      }
+    }
     draw();
   };
   const up = () => {
     window.removeEventListener("pointermove", move);
     window.removeEventListener("pointerup", up);
+    const target = dropTheory.value;
+    dropTheory.value = null;
+    if (movable && target) {
+      // The term is about to belong to another theory: put it back where it was
+      // and let Rust re-place it in its new home, instead of saving this drag.
+      for (const entry of dragNodes) {
+        entry.node.x = entry.x;
+        entry.node.y = entry.y;
+      }
+      beforeDrag = new Map();
+      dragNodes = [];
+      emit("assign", assignable, target);
+      draw();
+      return;
+    }
     endDrag();
   };
   window.addEventListener("pointermove", move);
   window.addEventListener("pointerup", up);
+}
+
+/** The theory node under a point in graph coordinates, ignoring `except`. */
+function theoryAt(
+  point: { x: number; y: number },
+  except?: string,
+): SimNode | null {
+  for (const node of [...currentNodes].reverse()) {
+    if (node.kind !== "theory") continue;
+    if (except && node.id === except) continue;
+    if (
+      Math.abs(point.x - node.x) <= halfWidth(node) &&
+      Math.abs(point.y - node.y) <= halfHeight(node)
+    ) {
+      return node;
+    }
+  }
+  return null;
 }
 
 function endDrag() {
@@ -667,6 +717,8 @@ function startLayerDrag(event: PointerEvent, layer: Layer) {
 /** Click versus double click, without relying on the browser's `click`. */
 let pressed: { id: string; x: number; y: number; moved: boolean } | null = null;
 let lastPick = { id: "", time: 0 };
+/** When the canvas background was last clicked, for stepping out of a theory. */
+let lastBackgroundClick = 0;
 
 function press(event: PointerEvent, node: SimNode) {
   pressed = { id: node.id, x: event.clientX, y: event.clientY, moved: false };
@@ -684,7 +736,7 @@ function release(event: PointerEvent, node: SimNode) {
   const state = pressed;
   pressed = null;
   if (!state || state.id !== node.id || state.moved) return;
-  const additive = event.ctrlKey || event.metaKey;
+  const additive = event.ctrlKey || event.metaKey || event.shiftKey;
   const now = Date.now();
   if (!additive && lastPick.id === node.id && now - lastPick.time < 380) {
     lastPick = { id: "", time: 0 };
@@ -699,6 +751,8 @@ function release(event: PointerEvent, node: SimNode) {
     return;
   }
   lastPick = { id: node.id, time: now };
+  // Clicking inside a multi-selection keeps it: the drag that follows moves it.
+  if (!additive && props.selectedIds.length > 1 && props.selectedIds.includes(node.id)) return;
   emit("pick", node.id, additive);
 }
 
@@ -712,6 +766,8 @@ function onBackgroundDown(event: PointerEvent) {
   if (event.button !== 0 || event.ctrlKey || event.metaKey) return;
   const origin = pointerInGraph(event);
   if (!origin || !root) return;
+  // Shift keeps what is selected: the rectangle then adds to it.
+  const additive = event.shiftKey;
   toolsOpen.value = false;
   target.value = null;
 
@@ -744,15 +800,20 @@ function onBackgroundDown(event: PointerEvent) {
     const top = Math.min(origin.y, point.y);
     const bottom = Math.max(origin.y, point.y);
     if (right - left < 4 && bottom - top < 4) {
-      emit("select", []);
+      // A click, not a drag: a second one in quick succession steps out of the
+      // theory, otherwise the click clears the selection (unless shift asked to
+      // keep it).
+      const now = Date.now();
+      const isDouble = now - lastBackgroundClick < 380;
+      lastBackgroundClick = isDouble ? 0 : now;
+      if (isDouble && onBackgroundDouble(origin)) return;
+      if (!additive) emit("select", []);
       return;
     }
-    emit(
-      "select",
-      currentNodes
-        .filter((node) => node.x >= left && node.x <= right && node.y >= top && node.y <= bottom)
-        .map((node) => node.id),
-    );
+    const hits = currentNodes
+      .filter((node) => node.x >= left && node.x <= right && node.y >= top && node.y <= bottom)
+      .map((node) => node.id);
+    emit("select", additive ? [...new Set([...props.selectedIds, ...hits])] : hits);
   };
 
   window.addEventListener("pointermove", move);
@@ -766,6 +827,32 @@ function openTools(at?: { x: number; y: number }) {
   toolsAt.value = at ?? null;
   toolsOpen.value = true;
   target.value = null;
+}
+
+/**
+ * Double click on the canvas outside the theory's rectangle: step back to the
+ * parent graph. Inside the rectangle nothing happens — that is the theory's own
+ * space.
+ *
+ * The browser's `dblclick` never arrives here: `pointerdown` on the canvas calls
+ * `preventDefault` for the rubber band, so clicks are counted by hand, the same
+ * way a node's clicks are.
+ */
+function onBackgroundDouble(point: { x: number; y: number }): boolean {
+  if (!props.theory || props.trail.length < 2) return false;
+  const rect = contentRect();
+  const inside =
+    rect !== null &&
+    point.x >= rect.left &&
+    point.x <= rect.right &&
+    point.y >= rect.top &&
+    point.y <= rect.bottom;
+  if (inside) return false;
+  const parent = props.trail[props.trail.length - 2];
+  hideCard();
+  edgeCard.value = null;
+  emit("crumb", parent?.key ?? "");
+  return true;
 }
 
 function onContextMenu(event: MouseEvent) {
@@ -835,16 +922,7 @@ function dropAxiom() {
 function dropTargetAt(event: DragEvent): SimNode | null {
   const point = pointerInGraph(event);
   if (!point) return null;
-  for (const node of [...currentNodes].reverse()) {
-    if (node.kind !== "theory") continue;
-    if (
-      Math.abs(point.x - node.x) <= halfWidth(node) &&
-      Math.abs(point.y - node.y) <= halfHeight(node)
-    ) {
-      return node;
-    }
-  }
-  return null;
+  return theoryAt(point);
 }
 
 function onDragOver(event: DragEvent) {
@@ -1550,10 +1628,22 @@ watch(
   stroke: var(--accent-bright);
 }
 
+/* A theory a term is about to be dropped into: deliberately not the selection
+   colour, so "this is selected" and "this is the drop target" never read the same. */
 .logic__host :deep(.logic-node[data-drop="true"] .logic-theory__box) {
-  fill: rgba(124, 171, 136, 0.22);
-  stroke: var(--ok);
-  stroke-dasharray: 4 3;
+  fill: rgba(140, 214, 165, 0.3);
+  stroke: #9be6b4;
+  stroke-width: 2;
+  stroke-dasharray: 5 3;
+  filter: drop-shadow(0 0 7px rgba(140, 220, 165, 0.55));
+}
+
+.logic__host :deep(.logic-node[data-drop="true"] .logic-theory__label) {
+  fill: #d8f5e4;
+}
+
+.logic__host :deep(.logic-node[data-drop="true"] .logic-theory__detail) {
+  fill: #a9d8bd;
 }
 
 .logic__host :deep(.logic-theory__label) {

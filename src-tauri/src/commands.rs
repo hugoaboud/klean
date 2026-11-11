@@ -570,6 +570,19 @@ fn attach_build_console(app: &tauri::AppHandle, project: &mut Project) {
     }));
 }
 
+/// The type of the term at a position (`line` is 1-based, `character` UTF-16).
+#[tauri::command(async)]
+pub fn lean_hover(
+    state: State<'_, AppState>,
+    id: String,
+    line: Option<u32>,
+    character: Option<u32>,
+) -> Result<Option<String>, String> {
+    with_project(&state, |project| {
+        project.lean_hover(&id, line, character).map_err(message)
+    })
+}
+
 /// Proof goals at a position (`line` is 1-based, `character` UTF-16 units).
 #[tauri::command(async)]
 pub fn lean_goals(

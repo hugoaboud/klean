@@ -249,18 +249,6 @@ pub fn tree(values: &BTreeMap<String, String>) -> Vec<SettingNode> {
     vec![
         lean,
         SettingNode::group(
-            "ast",
-            "AST",
-            "Nothing to configure yet.",
-            Vec::new(),
-        ),
-        SettingNode::group(
-            "logic",
-            "Logic",
-            "Nothing to configure yet: theories and layers live on the logic board.",
-            Vec::new(),
-        ),
-        SettingNode::group(
             "ai",
             "AI",
             "Off by default; the options below appear when it is switched on.",
@@ -285,7 +273,7 @@ pub fn defaults() -> Vec<(&'static str, String)> {
 
 /// True when `id` names a known setting (groups included).
 pub fn is_known(id: &str) -> bool {
-    matches!(id, "lean" | "ast" | "logic" | "ai" | "ai.model" | "ai.sandbox")
+    matches!(id, "lean" | "ai" | "ai.model" | "ai.sandbox")
         || matches!(
             id,
             toolchain::SETTING_ENABLED

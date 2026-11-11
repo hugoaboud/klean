@@ -345,6 +345,22 @@ impl Engine {
         .map_err(|error| LeanError::msg(error.to_string()))
     }
 
+    /// The type of the term at a position, from the language server.
+    pub fn hover(
+        &mut self,
+        absolute: &Path,
+        source: &str,
+        line: u32,
+        character: u32,
+    ) -> LeanResult<Option<String>> {
+        if !self.settings.enabled {
+            return Err(LeanError::msg("Lean integration is switched off"));
+        }
+        let timeout = Duration::from_secs(self.settings.timeout);
+        let client = self.client()?;
+        client.hover(absolute, source, line, character, timeout)
+    }
+
     /// Goals at a position: 1-based line, 0-based UTF-16 column.
     pub fn goals(
         &mut self,

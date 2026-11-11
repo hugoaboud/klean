@@ -135,7 +135,7 @@ watch(selected, (isSelected) => {
       :title="tooltip"
       :draggable="canDrag || undefined"
       :data-drop="dragOver || undefined"
-      @click="emit('pick', node.id, $event.ctrlKey || $event.metaKey)"
+      @click="emit('pick', node.id, $event.ctrlKey || $event.metaKey || $event.shiftKey)"
       @dblclick.stop="node.kind === 'theory' ? emit('openTheory', node.id) : emit('open', node.id)"
       @dragstart="onDragStart"
       @dragover.prevent="acceptsDrop ? (dragOver = true) : undefined"

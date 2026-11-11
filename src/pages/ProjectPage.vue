@@ -87,6 +87,13 @@ async function answerBuild(build: boolean) {
   if (build) await actions.buildLean();
 }
 
+/** What the console says before anything has run. */
+const emptyConsole = computed(() =>
+  canBuild()
+    ? "press build to run `lake build`; its output streams here"
+    : "this project has no lakefile, or Lean is not set up — see Settings → Lean",
+);
+
 /** Keeps the console scrolled to the newest line. */
 const consoleBox = ref<HTMLElement | null>(null);
 watch(
@@ -177,7 +184,7 @@ async function copyPrinted() {
     <SettingsModal
       :open="state.settingsOpen"
       :tree="state.settings"
-      :root-id="state.boardView === 'logic' ? 'logic' : 'ast'"
+      root-id="lean"
       :lean="state.lean"
       :install="state.install"
       @close="actions.setSettingsOpen(false)"
@@ -349,11 +356,16 @@ async function copyPrinted() {
         :save-error="state.saveError"
         :goals="state.goals"
         :goals-busy="state.goalsBusy"
+        :term="state.term"
+        :term-busy="state.termBusy"
         :processing="editorProcessing"
         @apply="actions.applyText"
         @comments="actions.applyComments"
         @rename="actions.rename"
-        @goals="(line: number, character: number) => actions.loadGoals(line, character)"
+        @goals="(line: number, character: number) => {
+          void actions.loadGoals(line, character);
+          void actions.loadTerm(line, character);
+        }"
         @file="actions.showFile()"
       />
     </UiModal>
@@ -423,10 +435,18 @@ async function copyPrinted() {
           >
             <UiIcon name="close" :size="11" /> cancel
           </UiButton>
-          <UiButton size="sm" variant="ghost" @click="actions.setBuildOpen(false)">close</UiButton>
+          <UiButton
+            v-else
+            size="sm"
+            variant="solid"
+            title="Run `lake build`"
+            @click="actions.buildLean()"
+          >
+            <UiIcon name="refresh" :size="11" /> build
+          </UiButton>
         </div>
         <pre ref="consoleBox" class="console__output k-mono">{{
-          (state.build?.lines ?? []).join("\n") || "no output yet"
+          (state.build?.lines ?? []).join("\n") || emptyConsole
         }}</pre>
       </div>
     </UiModal>
