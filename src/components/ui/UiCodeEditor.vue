@@ -24,6 +24,8 @@ const props = withDefaults(
 const emit = defineEmits<{
   "update:modelValue": [string];
   commit: [];
+  /** Caret position: 1-based line inside the text, UTF-16 column from 0. */
+  caret: [number, number];
 }>();
 
 /** Must match the editor CSS: line height and top padding in pixels. */
@@ -61,6 +63,19 @@ function escapeHtml(text: string) {
 function onInput(event: Event) {
   const target = event.target as HTMLTextAreaElement;
   emit("update:modelValue", target.value);
+}
+
+/**
+ * Reports where the caret is, in the units Lean counts in: lines from 1 and
+ * UTF-16 code units from the start of the line.
+ */
+function onCaret(event: Event) {
+  const target = event.target as HTMLTextAreaElement;
+  const offset = target.selectionStart ?? 0;
+  const before = target.value.slice(0, offset);
+  const line = before.split("\n").length;
+  const character = offset - (before.lastIndexOf("\n") + 1);
+  emit("caret", line, character);
 }
 
 function syncScroll() {
@@ -166,6 +181,9 @@ defineExpose({ focus });
       @input="onInput"
       @scroll="syncScroll"
       @keydown="onKeydown"
+      @keyup="onCaret"
+      @click="onCaret"
+      @select="onCaret"
     />
   </div>
 </template>

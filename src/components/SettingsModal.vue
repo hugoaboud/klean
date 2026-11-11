@@ -6,7 +6,7 @@
 // text. Nothing is written until "save" — closing with unsaved changes asks
 // first.
 import { computed, ref, watch } from "vue";
-import type { SettingNode } from "../api/lean";
+import type { LeanStatus, SettingNode } from "../api/lean";
 import UiButton from "./ui/UiButton.vue";
 import UiIcon from "./ui/UiIcon.vue";
 import UiModal from "./ui/UiModal.vue";
@@ -16,11 +16,18 @@ const props = defineProps<{
   tree: SettingNode[];
   /** Group left open by default: the one belonging to the current page. */
   rootId: string;
+  /** Lean's state, shown at the top of the Lean group. */
+  lean?: LeanStatus | null;
+  /** Last line the toolchain installer printed. */
+  install?: string | null;
 }>();
 
 const emit = defineEmits<{
   close: [];
   save: [[string, string][]];
+  /** An `action` row was clicked: the setting id names what to do. */
+  action: [string];
+  refresh: [];
 }>();
 
 const draft = ref<SettingNode[]>([]);
@@ -61,6 +68,14 @@ watch(
   { immediate: true, deep: false },
 );
 
+/** One line describing the toolchain Lean will run. */
+const leanLabel = computed(() => {
+  const lean = props.lean;
+  if (!lean) return "not checked yet";
+  if (!lean.available) return lean.error ?? "no Lean toolchain";
+  return `${lean.version || "Lean"} · ${lean.origin}${lean.build ? ` · ${lean.build}` : ""}`;
+});
+
 const original = computed(() => collect(props.tree, new Map()));
 const current = computed(() => collect(draft.value, new Map()));
 const dirty = computed(() => {
@@ -70,10 +85,16 @@ const dirty = computed(() => {
   return false;
 });
 
-/** A setting is shown unless it waits on a switch that is off. */
+/**
+ * A setting is shown unless it waits on a switch that is off. `id` means "that
+ * switch is on"; `id=value` means "that choice has this value".
+ */
 function visible(node: SettingNode): boolean {
-  if (!node.depends_on) return true;
-  return current.value.get(node.depends_on) === "true";
+  const gate = node.depends_on;
+  if (!gate) return true;
+  const [id, value] = gate.split("=");
+  if (value === undefined) return current.value.get(id) === "true";
+  return current.value.get(id) === value;
 }
 
 function toggle(id: string) {
@@ -149,6 +170,12 @@ function discard() {
               </button>
 
               <template v-if="child.kind === 'group' && expanded.has(child.id)">
+                <div v-if="child.id === 'lean'" class="settings__lean">
+                  <span class="k-mono" :data-tone="props.lean?.available ? 'ok' : 'error'">
+                    {{ leanLabel }}
+                  </span>
+                  <UiButton size="sm" variant="ghost" @click="emit('refresh')">re-check</UiButton>
+                </div>
                 <label
                   v-for="leaf in child.children.filter(visible)"
                   :key="leaf.id"
@@ -179,6 +206,16 @@ function discard() {
                       {{ option }}
                     </option>
                   </select>
+
+                  <UiButton
+                    v-else-if="leaf.kind === 'action'"
+                    size="sm"
+                    variant="subtle"
+                    :disabled="Boolean(props.install)"
+                    @click="emit('action', leaf.id)"
+                  >
+                    {{ props.install ?? leaf.label }}
+                  </UiButton>
 
                   <input
                     v-else
@@ -219,6 +256,16 @@ function discard() {
                   </option>
                 </select>
 
+                <UiButton
+                  v-else-if="child.kind === 'action'"
+                  size="sm"
+                  variant="subtle"
+                  :disabled="Boolean(props.install)"
+                  @click="emit('action', child.id)"
+                >
+                  {{ props.install ?? child.label }}
+                </UiButton>
+
                 <input
                   v-else
                   class="settings__input k-mono"
@@ -244,6 +291,31 @@ function discard() {
 </template>
 
 <style scoped>
+.settings__lean {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 6px;
+}
+
+.settings__lean .k-mono {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-ghost);
+  font-size: var(--fs-micro);
+}
+
+.settings__lean .k-mono[data-tone="ok"] {
+  color: var(--ok);
+}
+
+.settings__lean .k-mono[data-tone="error"] {
+  color: var(--danger);
+}
+
 .settings {
   display: flex;
   flex-direction: column;

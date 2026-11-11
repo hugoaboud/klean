@@ -30,9 +30,9 @@ pub struct Term {
     pub signature: Option<String>,
     /// Namespace chain, outermost first, as fully qualified names.
     pub namespaces: Vec<String>,
-    /// Span of the declared name inside `text`, so it is not counted as a use.
-    pub own_name: Option<(u32, u32)>,
-    /// The declaration as written, for name resolution.
+    /// Identifiers the declaration uses, as Lean's parser sees them.
+    pub idents: Vec<String>,
+    /// The declaration as written, for the reference edges.
     pub text: String,
 }
 
@@ -229,8 +229,9 @@ pub fn build(catalog: &Catalog, layout: &LayoutFile, open: Option<&str>) -> Logi
 }
 
 /// Resolves which terms use which, by name: the full name first, then the last
-/// component. KLEAN does not elaborate, so shadowed or ambiguous names can add a
-/// use — a documented heuristic.
+/// component. The identifiers come from Lean's parser, but the resolution is
+/// KLEAN's own: a shadowed or ambiguous name can add a use — a documented
+/// heuristic. (The proof state of each term is Lean's, not a guess.)
 pub fn resolve_uses(catalog: &mut Catalog) {
     use std::collections::HashMap;
 
@@ -247,16 +248,7 @@ pub fn resolve_uses(catalog: &mut Catalog) {
     let mut uses = Vec::new();
     let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
     for (index, term) in catalog.terms.iter().enumerate() {
-        for token in super::syntax::lexer::tokenize(&term.text) {
-            if token.kind != super::syntax::lexer::TokenKind::Ident {
-                continue;
-            }
-            if let Some((start, end)) = term.own_name {
-                if token.start == start && token.end == end {
-                    continue;
-                }
-            }
-            let raw = token.text(&term.text);
+        for raw in &term.idents {
             let short = raw.rsplit('.').next().unwrap_or(raw);
             if short.chars().count() < 2 {
                 continue;

@@ -28,3 +28,9 @@ dist-ssr
 .klean.secrets
 
 .reasonix
+
+# lean4-ast: the sources are part of the project, the checkout and the build are not
+lean4-ast/.cache
+lean4-ast/build
+lean4-ast/lean
+lean4-ast/crates/klean-ast/target

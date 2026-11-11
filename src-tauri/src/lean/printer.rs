@@ -6,7 +6,7 @@
 //! for composite containers. It is meant for reading and reviewing a project,
 //! not for replacing its sources.
 
-use super::syntax::{NodeKind, ParsedFile, SyntaxNode};
+use super::ast::{is_block, is_declaration, slice, AstNode, ParsedFile};
 
 /// Renders a whole file, including a banner and the leading module doc comment.
 pub fn print_file(rel: &str, source: &str, parsed: &ParsedFile) -> String {
@@ -33,14 +33,14 @@ pub fn print_file(rel: &str, source: &str, parsed: &ParsedFile) -> String {
 
 fn describe_file(parsed: &ParsedFile) -> String {
     let mut parts = Vec::new();
-    let imports = parsed.count_kind(NodeKind::Import);
+    let imports = parsed.count_kind("import");
     if imports > 0 {
         parts.push(format!("{imports} import{}", plural(imports)));
     }
     let decls = parsed
         .nodes
         .iter()
-        .filter(|node| node.kind.is_declaration())
+        .filter(|node| is_declaration(&node.kind))
         .count();
     if decls > 0 {
         parts.push(format!("{decls} top-level declaration{}", plural(decls)));
@@ -48,7 +48,7 @@ fn describe_file(parsed: &ParsedFile) -> String {
     let containers = parsed
         .nodes
         .iter()
-        .filter(|node| node.kind.is_block())
+        .filter(|node| is_block(&node.kind))
         .count();
     if containers > 0 {
         parts.push(format!("{containers} section{}", plural(containers)));
@@ -64,7 +64,7 @@ fn plural(count: usize) -> &'static str {
     }
 }
 
-fn render(out: &mut String, node: &SyntaxNode, source: &str, depth: usize) {
+fn render(out: &mut String, node: &AstNode, source: &str, depth: usize) {
     let indent = "  ".repeat(depth);
 
     match &node.doc {
@@ -79,18 +79,16 @@ fn render(out: &mut String, node: &SyntaxNode, source: &str, depth: usize) {
         }
     }
 
-    if node.kind.is_block() {
-        let header = node
-            .header
-            .map(|span| slice(source, span))
-            .unwrap_or_else(|| node.kind.label().to_string())
+    if is_block(&node.kind) {
+        // The header of a block is its first line: `namespace Foo`.
+        let header = source
+            .get(node.span.start as usize..)
+            .and_then(|rest| rest.lines().next())
+            .unwrap_or(&node.kind)
             .trim()
             .to_string();
         out.push_str(&format!("{indent}-- ══ {} ══\n", header.replace('\n', " ")));
-        let base = node
-            .header
-            .map(|span| column_of(source, span.start))
-            .unwrap_or(0);
+        let base = column_of(source, node.span.start);
         out.push_str(&reindent(&header, &indent, base));
         out.push('\n');
         for child in &node.children {
@@ -103,7 +101,7 @@ fn render(out: &mut String, node: &SyntaxNode, source: &str, depth: usize) {
         }
         out.push('\n');
     } else {
-        let text = slice(source, node.span);
+        let text = slice(source, node.inner);
         let base = column_of(source, node.span.start);
         out.push_str(&reindent(&text, &indent, base));
         out.push('\n');
@@ -116,10 +114,10 @@ fn render(out: &mut String, node: &SyntaxNode, source: &str, depth: usize) {
 
 /// One-line description for declarations that have no doc comment. Nodes whose
 /// header already says everything (a plain `def`) get no comment at all.
-fn describe_node(node: &SyntaxNode) -> Option<String> {
+fn describe_node(node: &AstNode) -> Option<String> {
     let name = node.name.as_deref();
-    match node.kind {
-        NodeKind::Structure | NodeKind::Class => {
+    match node.kind.as_str() {
+        "structure" | "class" => {
             let fields = node
                 .children
                 .iter()
@@ -127,13 +125,13 @@ fn describe_node(node: &SyntaxNode) -> Option<String> {
                 .collect::<Vec<_>>();
             Some(match name {
                 Some(name) if !fields.is_empty() => {
-                    format!("{} {name} · {} fields: {}", node.kind.label(), fields.len(), fields.join(", "))
+                    format!("{} {name} · {} fields: {}", node.kind, fields.len(), fields.join(", "))
                 }
-                Some(name) => format!("{} {name}", node.kind.label()),
-                None => format!("{} with {} fields", node.kind.label(), fields.len()),
+                Some(name) => format!("{} {name}", node.kind),
+                None => format!("{} with {} fields", node.kind, fields.len()),
             })
         }
-        NodeKind::Inductive => {
+        "inductive" => {
             let ctors = node
                 .children
                 .iter()
@@ -147,7 +145,7 @@ fn describe_node(node: &SyntaxNode) -> Option<String> {
                 None => "inductive type".to_string(),
             })
         }
-        kind if kind.has_where_block() && !node.children.is_empty() => {
+        kind if has_where_block(kind) && !node.children.is_empty() => {
             let locals = node
                 .children
                 .iter()
@@ -155,16 +153,24 @@ fn describe_node(node: &SyntaxNode) -> Option<String> {
                 .collect::<Vec<_>>();
             Some(format!(
                 "{} {} · {} local declaration{}: {}",
-                kind.label(),
+                kind,
                 name.unwrap_or("(anonymous)"),
                 locals.len(),
                 plural(locals.len()),
                 locals.join(", ")
             ))
         }
-        NodeKind::Mutual => Some(format!("mutual block · {} declarations", node.children.len())),
+        "mutual" => Some(format!("mutual block · {} declarations", node.children.len())),
         _ => None,
     }
+}
+
+/// Kinds that may carry a `where` block.
+fn has_where_block(kind: &str) -> bool {
+    matches!(
+        kind,
+        "def" | "theorem" | "lemma" | "abbrev" | "instance" | "opaque" | "example"
+    )
 }
 
 /// Wraps free text into a Lean block comment with the given indentation.
@@ -187,12 +193,6 @@ pub fn block_comment(text: &str, indent: &str) -> String {
     out.push_str(indent);
     out.push_str("-/");
     out
-}
-
-fn slice(source: &str, span: super::syntax::Span) -> String {
-    let start = (span.start as usize).min(source.len());
-    let end = (span.end as usize).min(source.len());
-    source[start..end].to_string()
 }
 
 /// Indents a block of text. The first line starts at the node's own token, so

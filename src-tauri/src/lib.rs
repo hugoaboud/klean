@@ -15,6 +15,10 @@ pub fn run() {
             if let Ok(dir) = app.path().app_config_dir() {
                 state.attach_recents(dir.join("recent-projects.json"));
             }
+            if let Ok(dir) = app.path().app_data_dir() {
+                let _ = std::fs::create_dir_all(&dir);
+                state.attach_app_data(dir);
+            }
             if let Some(path) = std::env::args().nth(1) {
                 if let Err(error) = state.preload(&path) {
                     eprintln!("klean: cannot open {path}: {error}");
@@ -64,6 +68,13 @@ pub fn run() {
             commands::delete_layer,
             commands::move_layer,
             commands::rename_layer,
+            commands::lean_status,
+            commands::lean_build,
+            commands::lean_build_state,
+            commands::lean_build_cancel,
+            commands::lean_check_file,
+            commands::lean_goals,
+            commands::lean_install,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Project shell: AST board (graph + tree) or Logic board, with the shared editor
 // modal and the bottom view switcher.
-import { computed, ref } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import GraphCanvas from "../components/GraphCanvas.vue";
 import LeanTreePanel from "../components/LeanTreePanel.vue";
@@ -16,7 +16,7 @@ import UiSpinner from "../components/ui/UiSpinner.vue";
 import UiSplitPane from "../components/ui/UiSplitPane.vue";
 import LogicPage from "./LogicPage.vue";
 import SettingsModal from "../components/SettingsModal.vue";
-import { actions, aiEnabled, state } from "../store/workspace";
+import { actions, aiEnabled, buildPrompt, canBuild, state } from "../store/workspace";
 
 const split = ref(0.44);
 const aiOn = computed(() => aiEnabled());
@@ -26,6 +26,14 @@ const deleteOpen = ref(false);
 const deleteTarget = ref("");
 
 const isLogic = computed(() => state.boardView === "logic");
+
+// The question belongs to a project, not to the app: ask when one appears.
+watch(
+  () => state.view?.label,
+  (label) => {
+    if (label) void nextTick(askToBuild);
+  },
+);
 const createInitial = computed(() => {
   const path = state.detail?.path ?? "";
   const slash = path.lastIndexOf("/");
@@ -49,6 +57,73 @@ function pickFromGraph(id: string, additive: boolean) {
 async function onSaveSettings(values: [string, string][]) {
   if (await actions.saveSettings(values)) actions.setSettingsOpen(false);
 }
+
+/** `action` rows in settings: only the Lean installer has one. */
+function onSettingAction(id: string) {
+  if (id === "lean.action.install") void actions.installLean();
+}
+
+/** The build question, asked once per project unless the answer is remembered. */
+const buildQuestion = ref(false);
+const buildRemember = ref(false);
+
+/** Shows the build question when a project opens, if it can be built. */
+function askToBuild() {
+  if (!canBuild()) return;
+  const prompt = buildPrompt();
+  if (prompt === "always") {
+    void actions.buildLean();
+    return;
+  }
+  if (prompt === "never") return;
+  buildQuestion.value = true;
+}
+
+async function answerBuild(build: boolean) {
+  buildQuestion.value = false;
+  if (buildRemember.value) {
+    await actions.setBuildPrompt(build ? "always" : "never");
+  }
+  if (build) await actions.buildLean();
+}
+
+/** Keeps the console scrolled to the newest line. */
+const consoleBox = ref<HTMLElement | null>(null);
+watch(
+  () => state.build?.lines.length ?? 0,
+  async () => {
+    await nextTick();
+    const box = consoleBox.value;
+    if (box) box.scrollTop = box.scrollHeight;
+  },
+);
+
+/** One line describing the toolchain, for the header badge. */
+const leanBadge = computed(() => {
+  const lean = state.lean;
+  if (!lean) return null;
+  if (!lean.enabled) return { tone: "muted", text: "lean off" };
+  if (lean.backend !== "folder") return { tone: "muted", text: "lean n/a" };
+  if (!lean.available) return { tone: "error", text: "no lean" };
+  if (lean.error) return { tone: "error", text: "lean error" };
+  const version = lean.version.match(/version ([\w.+-]+)/)?.[1] ?? "";
+  return { tone: "ok", text: `lean ${version || lean.origin}` };
+});
+
+/** What the header says while Lean is still working through the project. */
+const processingLabel = computed(() => {
+  const files = state.processingFiles;
+  if (!state.processing) return null;
+  if (files.length === 0) return "checking…";
+  if (files.length === 1) return `checking ${files[0]}`;
+  return `checking ${files.length} files`;
+});
+
+/** True when the file open in the modal is one Lean is still working on. */
+const editorProcessing = computed(() => {
+  const path = state.detail?.path;
+  return Boolean(path && state.processingFiles.includes(path));
+});
 
 function toggleGraph(id: string) {
   void actions.toggleGraph(id);
@@ -103,8 +178,12 @@ async function copyPrinted() {
       :open="state.settingsOpen"
       :tree="state.settings"
       :root-id="state.boardView === 'logic' ? 'logic' : 'ast'"
+      :lean="state.lean"
+      :install="state.install"
       @close="actions.setSettingsOpen(false)"
       @save="onSaveSettings"
+      @refresh="actions.refreshLean()"
+      @action="onSettingAction"
     />
 
     <header class="board__bar">
@@ -135,6 +214,32 @@ async function copyPrinted() {
       <span class="k-spacer" />
 
       <div class="board__actions">
+        <button
+          v-if="leanBadge"
+          class="board__lean k-mono"
+          type="button"
+          :data-tone="leanBadge.tone"
+          :title="state.lean?.error ?? state.lean?.lean ?? 'Lean toolchain'"
+          @click="actions.setSettingsOpen(true)"
+        >
+          <UiSpinner v-if="state.lean?.building" :size="9" />
+          {{ leanBadge.text }}
+        </button>
+        <span v-if="processingLabel" class="board__processing k-mono" :title="processingLabel">
+          <UiSpinner :size="9" />
+          {{ processingLabel }}
+        </span>
+        <UiButton
+          v-if="canBuild()"
+          size="sm"
+          variant="ghost"
+          title="Build the project (`lake build`), with the output in a console"
+          @click="state.build ? actions.showBuild() : actions.buildLean()"
+        >
+          <UiSpinner v-if="state.busy === 'lean'" :size="10" />
+          <UiIcon v-else name="refresh" :size="11" />
+          build
+        </UiButton>
         <UiButton
           size="sm"
           variant="ghost"
@@ -242,9 +347,13 @@ async function copyPrinted() {
         :ai-enabled="aiOn"
         :saving="state.saving"
         :save-error="state.saveError"
+        :goals="state.goals"
+        :goals-busy="state.goalsBusy"
+        :processing="editorProcessing"
         @apply="actions.applyText"
         @comments="actions.applyComments"
         @rename="actions.rename"
+        @goals="(line: number, character: number) => actions.loadGoals(line, character)"
         @file="actions.showFile()"
       />
     </UiModal>
@@ -264,6 +373,62 @@ async function copyPrinted() {
         @save="savePrinted"
         @close="actions.closePrinted()"
       />
+    </UiModal>
+
+    <UiModal
+      :open="buildQuestion"
+      title="build this project?"
+      :subtitle="state.view?.label ?? ''"
+      :width="440"
+      :height="180"
+      @close="answerBuild(false)"
+    >
+      <div class="build-ask">
+        <p class="build-ask__text">
+          KLEAN can run <code>lake build</code> so imports resolve for the parser and the
+          language server. It runs in the background with a memory ceiling, and its output
+          streams into a console.
+        </p>
+        <label class="build-ask__remember">
+          <input v-model="buildRemember" type="checkbox" />
+          don't ask again for this project
+        </label>
+        <div class="build-ask__actions">
+          <UiButton size="sm" variant="ghost" @click="answerBuild(false)">skip</UiButton>
+          <UiButton size="sm" variant="solid" @click="answerBuild(true)">build now</UiButton>
+        </div>
+      </div>
+    </UiModal>
+
+    <UiModal
+      :open="state.buildOpen"
+      title="build console"
+      :subtitle="state.build?.summary ?? state.build?.command ?? 'lake build'"
+      :width="820"
+      :height="520"
+      :resizable="true"
+      @close="actions.setBuildOpen(false)"
+    >
+      <div class="console">
+        <div class="console__bar">
+          <span class="k-mono console__state" :data-running="state.build?.running || undefined">
+            {{ state.build?.running ? `running · ${state.build.seconds}s` : state.build?.summary ?? "no build yet" }}
+          </span>
+          <span class="k-spacer" />
+          <UiButton
+            v-if="state.build?.running"
+            size="sm"
+            variant="ghost"
+            @click="actions.cancelBuild()"
+          >
+            <UiIcon name="close" :size="11" /> cancel
+          </UiButton>
+          <UiButton size="sm" variant="ghost" @click="actions.setBuildOpen(false)">close</UiButton>
+        </div>
+        <pre ref="consoleBox" class="console__output k-mono">{{
+          (state.build?.lines ?? []).join("\n") || "no output yet"
+        }}</pre>
+      </div>
     </UiModal>
 
     <UiPrompt
@@ -290,6 +455,77 @@ async function copyPrinted() {
 </template>
 
 <style scoped>
+.console {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 6px;
+}
+
+.console__bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.console__state {
+  color: var(--text-ghost);
+  font-size: var(--fs-micro);
+}
+
+.console__state[data-running] {
+  color: var(--accent);
+}
+
+.console__output {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #0b0d0f;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.build-ask {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 2px 2px 0;
+}
+
+.build-ask__text {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+}
+
+.build-ask__text code {
+  color: var(--text-dim);
+  font-family: var(--mono);
+}
+
+.build-ask__remember {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-ghost);
+  font-size: var(--fs-micro);
+}
+
+.build-ask__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 .board {
   position: relative;
   display: flex;
@@ -384,6 +620,47 @@ async function copyPrinted() {
   display: flex;
   align-items: center;
   gap: 4px;
+}
+
+.board__processing {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 22ch;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--accent);
+  font-size: var(--fs-micro);
+}
+
+.board__lean {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: none;
+  color: var(--text-ghost);
+  font-size: var(--fs-micro);
+  transition: border-color var(--t) var(--ease), color var(--t) var(--ease);
+}
+
+.board__lean:hover {
+  border-color: var(--line-strong);
+  color: var(--text-faint);
+}
+
+.board__lean[data-tone="ok"] {
+  color: var(--ok);
+  border-color: rgba(120, 170, 130, 0.25);
+}
+
+.board__lean[data-tone="error"] {
+  color: var(--danger);
+  border-color: rgba(194, 112, 112, 0.3);
 }
 
 .board__ticker {

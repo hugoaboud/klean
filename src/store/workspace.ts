@@ -5,6 +5,7 @@
 // whether the editor modal is open, and which board view is selected.
 
 import { reactive } from "vue";
+import { listen } from "@tauri-apps/api/event";
 import * as api from "../api/lean";
 
 export type Page = "welcome" | "project";
@@ -40,6 +41,21 @@ interface State {
   settingsOpen: boolean;
   /** Details of the node under the pointer, for the graph's info card. */
   hover: api.NodeDetail | null;
+  /** Lean's toolchain and build state for this project. */
+  lean: api.LeanStatus | null;
+  /** Goals of the node open in the editor, from Lean's language server. */
+  goals: api.Goals | null;
+  goalsBusy: boolean;
+  /** Last line the toolchain installer printed. */
+  install: string | null;
+  /** The `lake build` console (empty until a build is started). */
+  build: api.BuildState | null;
+  /** True while the build console is open. */
+  buildOpen: boolean;
+  /** True while Lean is still processing at least one file. */
+  processing: boolean;
+  /** Files being processed, for the modal's indicator. */
+  processingFiles: string[];
 }
 
 export const state = reactive<State>({
@@ -64,6 +80,14 @@ export const state = reactive<State>({
   settings: [],
   settingsOpen: false,
   hover: null,
+  lean: null,
+  goals: null,
+  goalsBusy: false,
+  install: null,
+  build: null,
+  buildOpen: false,
+  processing: false,
+  processingFiles: [],
 });
 
 async function run<T>(label: string, action: () => Promise<T>): Promise<T | null> {
@@ -104,12 +128,130 @@ function adopt(view: api.WorkspaceView) {
   state.logic = null;
   state.openTheory = "";
   state.page = "project";
-  void loadSettings();
+  state.lean = null;
+  state.goals = null;
+  state.processing = false;
+  state.processingFiles = [];
+  // Opening a project reads settings and the toolchain status — nothing more.
+  // Parsing, checking and building are the user's call from here on.
+  void (async () => {
+    await loadSettings();
+    await loadLean();
+    await pollBuild();
+  })();
 }
 
 async function loadGraph() {
   const graph = await run("graph", () => api.graphView());
   if (graph) state.graph = graph;
+}
+
+/**
+ * Re-reads Lean's state. `build` asks for `lake build` first, which is what
+ * makes imports resolve for every later check.
+ */
+async function loadLean() {
+  const status = await run("lean", () => api.leanStatus());
+  if (!status) return;
+  state.lean = status;
+}
+
+/** True when this project can be built at all (a Lake package with `lake`). */
+export function canBuild(): boolean {
+  return Boolean(state.lean?.available && state.lean?.lake);
+}
+
+/** Whether to ask before building when a project opens. */
+export function buildPrompt(): "ask" | "always" | "never" {
+  const value = settingValue("lean.build.prompt", "ask");
+  return value === "always" || value === "never" ? value : "ask";
+}
+
+/** Reads the build console from Rust (cheap: it is a snapshot). */
+async function pollBuild() {
+  const build = await api.leanBuildState().catch(() => null);
+  if (!build) return;
+  state.build = build;
+  if (build.running) {
+    window.setTimeout(() => void pollBuild(), 700);
+    return;
+  }
+  if (build.summary && !build.failed) {
+    // A finished build changes what Lean can resolve.
+    const view = await api.workspaceView().catch(() => null);
+    if (view) state.view = view;
+    await reloadBoards();
+  }
+}
+
+/**
+ * Polls Lean while it is still processing: the worker keeps checking in the
+ * background, and the boards are re-read whenever it becomes idle again.
+ */
+async function pollProcessing() {
+  if (pollTimer !== null) return;
+  const tick = async () => {
+    const status = await api.leanStatus().catch(() => null);
+    if (!status) {
+      pollTimer = null;
+      return;
+    }
+    state.lean = status;
+    state.processing = status.processing.length > 0;
+    state.processingFiles = status.processing;
+    if (state.processing) {
+      pollTimer = window.setTimeout(tick, 600);
+      return;
+    }
+    pollTimer = null;
+    // Lean settled: pick up the diagnostics it published.
+    const view = await api.workspaceView().catch(() => null);
+    if (view) state.view = view;
+    await reloadBoards();
+    const id = state.detail?.id;
+    if (id && state.editorOpen) {
+      const detail = await api.nodeDetail(id).catch(() => null);
+      if (detail) state.detail = detail;
+    }
+  };
+  pollTimer = window.setTimeout(tick, 120);
+}
+
+/** Current value of one setting leaf, or `fallback` when it is unknown. */
+function settingValue(id: string, fallback: string): string {
+  const walk = (nodes: api.SettingNode[]): string | null => {
+    for (const node of nodes) {
+      if (node.id === id) return node.value;
+      const inner = walk(node.children);
+      if (inner !== null) return inner;
+    }
+    return null;
+  };
+  return walk(state.settings) ?? fallback;
+}
+
+/**
+ * Goals for the node in the editor at `line`/`character`, both relative to the
+ * node's own text. Without a position, the end of the declaration is asked.
+ */
+async function loadGoals(line?: number, character?: number) {
+  const id = state.detail?.id;
+  if (!id) {
+    state.goals = null;
+    return;
+  }
+  state.goalsBusy = true;
+  try {
+    state.goals = await api.leanGoals(id, line, character);
+  } catch (error) {
+    state.goals = {
+      goals: [],
+      rendered: "",
+      note: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    state.goalsBusy = false;
+  }
 }
 
 async function loadSettings() {
@@ -154,6 +296,8 @@ const pending: {
   camera: Record<string, api.Camera>;
 } = { positions: {}, camera: {} };
 let flushTimer: number | null = null;
+/** Set while Lean is being polled after an edit or a project switch. */
+let pollTimer: number | null = null;
 /** Guards against an older hover response overwriting a newer one. */
 let hoverSeq = 0;
 let flushAgain = false;
@@ -261,13 +405,17 @@ if (typeof window !== "undefined") {
 export const actions = {
   /** Adopts a project Rust already has open (e.g. given on the command line). */
   async bootstrap() {
+    // The welcome page does no Lean work at all: it lists recents and stops.
     await loadRecents();
     try {
+      // Only a project given on the command line is open at this point.
       const view = await api.workspaceView();
       state.view = view;
       state.page = "project";
       await loadGraph();
       await loadSettings();
+      await loadLean();
+      void pollBuild();
       // A board that starts on the logic view needs its graph loaded too.
       if (state.boardView === "logic") await loadLogic();
     } catch {
@@ -364,6 +512,11 @@ export const actions = {
     state.editorOpen = false;
     state.printed = null;
     state.printedOpen = false;
+    state.lean = null;
+    state.goals = null;
+    state.install = null;
+    state.processing = false;
+    state.processingFiles = [];
     await loadRecents();
   },
 
@@ -410,7 +563,87 @@ export const actions = {
     state.saveError = null;
     if (!DETAILABLE.test(id)) return;
     state.editorOpen = true;
+    state.goals = null;
     await loadDetail(id);
+    void loadGoals();
+    // Only the file the user opened is checked, never the whole project.
+    void api.leanCheckFile(id).then(() => pollProcessing()).catch(() => {});
+  },
+
+  /** Re-reads Lean's state for this project (toolchain, server, build). */
+  async refreshLean() {
+    await loadLean();
+    await pollBuild();
+  },
+
+  /** Starts `lake build`, and opens the console that follows it. */
+  async buildLean() {
+    state.buildOpen = true;
+    const build = await run("build", () => api.leanBuild());
+    if (!build) return;
+    state.build = build;
+    void pollBuild();
+  },
+
+  /** Opens the console for the last build, without starting a new one. */
+  async showBuild() {
+    state.buildOpen = true;
+    await pollBuild();
+  },
+
+  setBuildOpen(open: boolean) {
+    state.buildOpen = open;
+  },
+
+  /** Remembers whether to ask before building (`ask` / `always` / `never`). */
+  async setBuildPrompt(value: "ask" | "always" | "never") {
+    const tree = await api
+      .saveSettings([["lean.build.prompt", value]])
+      .catch(() => null);
+    if (tree) state.settings = tree;
+  },
+
+  /** Stops a running build. */
+  async cancelBuild() {
+    const build = await run("build", () => api.leanBuildCancel()).catch(() => null);
+    if (build) state.build = build;
+  },
+
+  /** Goals at a position in the open node. */
+  async loadGoals(line?: number, character?: number) {
+    await loadGoals(line, character);
+  },
+
+  /** Installs Lean through the app, reporting progress as it goes. */
+  async installLean() {
+    state.install = "starting…";
+    const path = await run("lean", () => api.leanInstall());
+    state.install = null;
+    if (!path) return;
+    state.notice = `Lean installed at ${path}`;
+    await loadSettings();
+    await loadLean();
+    await actions.refresh();
+  },
+
+  /** Subscribes to the background work's progress; called once at startup. */
+  async listen() {
+    await listen<string>("lean-install", (event) => {
+      state.install = event.payload;
+    });
+    await listen<string>("lean-build-output", (event) => {
+      if (!state.build) {
+        state.build = {
+          running: true,
+          command: "lake build",
+          lines: [],
+          summary: null,
+          failed: false,
+          seconds: 0,
+        };
+      }
+      state.build.lines = [...state.build.lines, event.payload].slice(-2000);
+    });
   },
 
   /** Moves terms (or namespaces) into a theory, or back to unassigned. */
@@ -569,6 +802,7 @@ export const actions = {
         state.view.stats = result.stats;
       }
       await reloadBoards();
+      void pollProcessing();
     } catch (error) {
       state.saveError = error instanceof Error ? error.message : String(error);
     } finally {
@@ -579,6 +813,7 @@ export const actions = {
   closeEditor() {
     state.editorOpen = false;
     state.saveError = null;
+    state.goals = null;
   },
 
   async toggleGraph(id: string) {
@@ -599,6 +834,8 @@ export const actions = {
         state.view.stats = result.stats;
       }
       await reloadBoards();
+      void loadGoals();
+      void pollProcessing();
     } catch (error) {
       state.saveError = error instanceof Error ? error.message : String(error);
     } finally {
@@ -620,6 +857,7 @@ export const actions = {
         state.view.stats = result.stats;
       }
       await reloadBoards();
+      void pollProcessing();
     } catch (error) {
       state.saveError = error instanceof Error ? error.message : String(error);
     } finally {

@@ -40,6 +40,8 @@ pub struct NodeDetail {
     pub text: String,
     pub editable: bool,
     pub start_line: u32,
+    /// 0-based UTF-16 column of the node's first character, on `start_line`.
+    pub start_column: u32,
     pub end_line: u32,
     pub doc: Option<String>,
     /// Plain (`--` / `/- -/`) comments sitting directly above the node.
@@ -130,8 +132,11 @@ pub struct UpdateResult {
     pub tree: Vec<TreeNode>,
     pub stats: Stats,
     pub diagnostics: Vec<DiagnosticDto>,
-    /// True when the edit left the file in a structurally broken state.
+    /// True when Lean reported no errors for the file.
     pub ok: bool,
+    /// True while the language server is still checking: the diagnostics above
+    /// are the previous ones, and the UI should ask again shortly.
+    pub processing: bool,
 }
 
 /// A remembered graph view, so a board looks the same when reopened.

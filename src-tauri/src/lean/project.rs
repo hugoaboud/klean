@@ -7,20 +7,21 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use super::ast::{
+    is_import, AstNode, Diagnostic, LineIndex, ParsedFile, Severity, Span,
+};
 use super::dto::{
     CameraDto, DiagnosticDto, GraphLink, GraphNode, LogicGraph, NodeDetail,
     ProjectGraph, SettingNode, Stats, TreeNode, UpdateResult, WorkspaceView,
 };
+use super::engine::{Engine, LeanStatus, Parse};
 use super::error::{LeanError, LeanResult};
 use super::fs::{content_hash, ProjectFs};
 use super::layout::{Camera, LayoutFile, Placement};
 use super::logic;
-use super::settings;
+use super::lsp::Goals;
 use super::printer;
-use super::syntax::lexer::{tokenize, TokenKind};
-use super::syntax::{
-    self, Diagnostic, LineIndex, NodeKind, ParsedFile, Severity, Span, SyntaxNode,
-};
+use super::settings;
 
 /// A file that belongs to a library.
 #[derive(Debug, Clone)]
@@ -53,6 +54,23 @@ pub struct CachedFile {
     pub hash: u64,
     pub parsed: ParsedFile,
     pub lines: LineIndex,
+    /// The language server's latest word on this file. It is a cell because the
+    /// server publishes asynchronously: the tree is parsed once, the diagnostics
+    /// keep arriving, and every reader sees the newest ones.
+    diagnostics: std::sync::Mutex<Vec<Diagnostic>>,
+    /// True when the tree was parsed with the file's own imports loaded, so
+    /// syntax extensions the project defines were understood.
+    pub exact: bool,
+}
+
+impl CachedFile {
+    /// The diagnostics Lean last reported for this file.
+    pub fn diagnostics(&self) -> Vec<Diagnostic> {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 /// Node id resolved back to something the project can act on.
@@ -76,7 +94,7 @@ namespace Starter
   /-- The answer. An axiom keeps the file free of imports. -/
   axiom answer : Nat
 
-  /-- The syntax tree of this theorem is what KLEAN edits; no type checking. -/
+  /-- KLEAN edits the syntax tree; Lean checks it once a folder project has it. -/
   theorem answer_eq : answer = answer := rfl
 
 end Starter
@@ -91,34 +109,50 @@ pub struct Project {
     graph_seeded: bool,
     /// Hand-placed positions, theories and layers, persisted in `.klean.json`.
     layout: LayoutFile,
+    /// The Lean toolchain, the parser library and the language server.
+    engine: Engine,
 }
 
 impl Project {
     // ------------------------------------------------------------- lifecycle
 
-    pub fn open(path: impl AsRef<std::path::Path>) -> LeanResult<Self> {
+    pub fn open(path: impl AsRef<std::path::Path>, app_data: impl AsRef<std::path::Path>) -> LeanResult<Self> {
         let fs = ProjectFs::physical(path)?;
-        Self::from_fs(fs)
+        Self::from_fs(fs, app_data.as_ref().to_path_buf())
     }
 
-    pub fn from_zip(bytes: &[u8], label: impl Into<String>) -> LeanResult<Self> {
+    pub fn from_zip(
+        bytes: &[u8],
+        label: impl Into<String>,
+        app_data: impl AsRef<std::path::Path>,
+    ) -> LeanResult<Self> {
         let fs = ProjectFs::from_zip(bytes, label)?;
-        Self::from_fs(fs)
+        Self::from_fs(fs, app_data.as_ref().to_path_buf())
     }
 
     /// A workspace backed by `MemoryFS`, seeded with a starter file so the
     /// in-memory backend is usable (and demonstrable) on its own.
-    pub fn memory(label: impl Into<String>) -> LeanResult<Self> {
+    pub fn memory(label: impl Into<String>, app_data: impl AsRef<std::path::Path>) -> LeanResult<Self> {
         let fs = ProjectFs::memory(label)?;
         if fs.walk_files("")?.is_empty() {
             fs.write("Main.lean", STARTER)?;
         }
-        Self::from_fs(fs)
+        Self::from_fs(fs, app_data.as_ref().to_path_buf())
     }
 
-    fn from_fs(fs: ProjectFs) -> LeanResult<Self> {
+    fn from_fs(fs: ProjectFs, app_data: std::path::PathBuf) -> LeanResult<Self> {
         let libs = discover_libs(&fs)?;
         let layout = LayoutFile::load(&fs);
+        let mut values = layout.settings().clone();
+        for (id, value) in settings::load_secrets(&fs) {
+            values.insert(id, value);
+        }
+        let engine = Engine::new(
+            app_data,
+            &values,
+            fs.origin().map(|root| root.to_path_buf()),
+            fs.backend().label(),
+        );
         Ok(Project {
             fs,
             libs,
@@ -126,7 +160,76 @@ impl Project {
             expanded: HashSet::new(),
             graph_seeded: false,
             layout,
+            engine,
         })
+    }
+
+    /// Lean as this project sees it: toolchain, parser, server, build, failures.
+    pub fn lean_status(&self) -> LeanStatus {
+        self.engine.status()
+    }
+
+    /// True while the language server is still working on this project.
+    pub fn lean_processing(&self) -> bool {
+        self.engine.processing()
+    }
+
+    /// Re-reads the Lean settings, restarts Lean and clears the parse cache.
+    pub fn reconfigure_lean(&mut self) {
+        let mut values = self.layout.settings().clone();
+        for (id, value) in settings::load_secrets(&self.fs) {
+            values.insert(id, value);
+        }
+        self.engine.reconfigure(&values);
+        self.cache.clear();
+    }
+
+    /// Starts `lake build` in the background; the console follows it.
+    pub fn lean_build(&mut self) -> LeanResult<()> {
+        self.engine.start_build()
+    }
+
+    /// The build console: tail of the output and how the build stands.
+    pub fn lean_build_state(&self) -> crate::lean::build::BuildState {
+        self.engine.build_state()
+    }
+
+    /// Stops a running build.
+    pub fn cancel_build(&mut self) {
+        self.engine.cancel_build();
+    }
+
+    /// Installs the callback that streams build output to the frontend.
+    pub fn set_build_sink(&mut self, sink: std::sync::Arc<dyn Fn(&str) + Send + Sync>) {
+        self.engine.set_build_sink(sink);
+    }
+
+    /// Proof goals at a position inside a node, from Lean's language server.
+    /// `line` is 1-based and `character` counts UTF-16 units, like the editor.
+    pub fn lean_goals(&mut self, id: &str, line: Option<u32>, character: Option<u32>) -> LeanResult<Goals> {
+        let (rel, default_line, default_char) = match self.resolve(id)? {
+            Target::Ast { rel, path } => {
+                let cached = self.load(&rel, Parse::Tree)?;
+                let node = cached
+                    .parsed
+                    .get(&path)
+                    .ok_or_else(|| LeanError::msg(format!("node `{id}` no longer exists")))?;
+                let line = cached.lines.line_of(node.inner.end);
+                (rel, line, 0)
+            }
+            Target::File(rel) | Target::AstGroup(rel) => (rel, 1, 0),
+            _ => return Err(LeanError::msg("only files and declarations have goals")),
+        };
+        let cached = self.load(&rel, Parse::Tree)?;
+        let source = cached.source.clone();
+        let absolute = self
+            .fs
+            .absolute(&rel)
+            .ok_or_else(|| LeanError::msg("Lean goals need a folder project"))?;
+        let line = line.unwrap_or(default_line);
+        let character = character.unwrap_or(default_char);
+        drop(cached);
+        self.engine.goals(&absolute, &source, line, character)
     }
 
     pub fn fs(&self) -> &ProjectFs {
@@ -143,15 +246,26 @@ impl Project {
 
     // ----------------------------------------------------------------- cache
 
-    fn load(&mut self, rel: &str) -> LeanResult<Arc<CachedFile>> {
+    /// Reads a file's tree, parsing it if needed.
+    ///
+    /// `Exact` re-parses a tree that was only parsed for the board (core syntax),
+    /// which is what happens the first time a file is opened in the editor.
+    fn load(&mut self, rel: &str, mode: Parse) -> LeanResult<Arc<CachedFile>> {
         let source = self.fs.read(rel)?;
         let hash = content_hash(&source);
         if let Some(cached) = self.cache.get(rel) {
-            if cached.hash == hash {
+            if cached.hash == hash && (mode == Parse::Tree || cached.exact) {
+                // Keep the diagnostics current: the server may have answered since
+                // the tree was parsed.
+                *cached
+                    .diagnostics
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    self.engine.diagnostics(rel);
                 return Ok(cached.clone());
             }
         }
-        let parsed = syntax::parse(&source);
+        let parsed = self.parse_with_lean(rel, &source, mode);
         let lines = LineIndex::new(&source);
         let entry = Arc::new(CachedFile {
             rel: rel.to_string(),
@@ -159,9 +273,74 @@ impl Project {
             hash,
             parsed,
             lines,
+            diagnostics: std::sync::Mutex::new(self.engine.diagnostics(rel)),
+            exact: mode == Parse::Exact,
         });
         self.cache.insert(rel.to_string(), entry.clone());
         Ok(entry)
+    }
+
+    /// Hands the file behind a node id to the language server.
+    pub fn check_node_file(&mut self, id: &str) -> LeanResult<()> {
+        let rel = match self.resolve(id)? {
+            Target::File(rel) | Target::AstGroup(rel) => rel,
+            Target::Ast { rel, .. } => rel,
+            _ => return Err(LeanError::msg("only files can be checked")),
+        };
+        self.check_file(&rel)
+    }
+
+    /// Hands a file to the language server so it checks it in the background.
+    ///
+    /// Only files the user actually touches are sent: opening a whole project in
+    /// the server makes Lean build an environment per file, which is the other
+    /// way this app used to run out of memory.
+    pub fn check_file(&mut self, rel: &str) -> LeanResult<()> {
+        let cached = self.load(rel, Parse::Tree)?;
+        let source = cached.source.clone();
+        drop(cached);
+        self.engine.sync(rel, &source);
+        Ok(())
+    }
+
+    /// Hands one file to Lean. A failure (no toolchain, an archive project, a
+    /// timeout) becomes a diagnostic instead of an error, so the board still
+    /// opens and says what is wrong.
+    fn parse_with_lean(&mut self, rel: &str, source: &str, mode: Parse) -> ParsedFile {
+        let Some(absolute) = self.fs.absolute(rel) else {
+            return ParsedFile {
+                nodes: Vec::new(),
+                diagnostics: vec![Diagnostic {
+                    line: 1,
+                    end_line: 1,
+                    span: Span::EMPTY,
+                    severity: Severity::Info,
+                    message:
+                        "Lean checks need a folder project: archives and in-memory workspaces are not built"
+                            .to_string(),
+                }],
+                module_doc: None,
+            };
+        };
+        let _ = &absolute;
+        let outcome = self.engine.parse(source, rel, mode);
+        if let Err(error) = &outcome {
+            eprintln!("klean: cannot parse {rel}: {error}");
+        }
+        match outcome {
+            Ok(parsed) => parsed,
+            Err(error) => ParsedFile {
+                nodes: Vec::new(),
+                diagnostics: vec![Diagnostic {
+                    line: 1,
+                    end_line: 1,
+                    span: Span::EMPTY,
+                    severity: Severity::Error,
+                    message: error.to_string(),
+                }],
+                module_doc: None,
+            },
+        }
     }
 
     fn load_all(&mut self) -> LeanResult<HashMap<String, Arc<CachedFile>>> {
@@ -173,7 +352,7 @@ impl Project {
             .map(|file| file.rel)
             .collect();
         for rel in rels {
-            let file = self.load(&rel)?;
+            let file = self.load(&rel, Parse::Tree)?;
             loaded.insert(rel, file);
         }
         Ok(loaded)
@@ -305,7 +484,13 @@ impl Project {
         }
         let detail = match cached {
             Some(cached) => {
-                let issues = cached.parsed.diagnostics.len();
+                // Informational messages (`#check` output) are not issues.
+                let issues = cached
+                    .parsed
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.severity != Severity::Info)
+                    .count();
                 if issues == 0 {
                     String::new()
                 } else {
@@ -337,7 +522,7 @@ impl Project {
         &self,
         rel: &str,
         path: &[usize],
-        node: &SyntaxNode,
+        node: &AstNode,
         cached: &CachedFile,
     ) -> TreeNode {
         let mut children = Vec::new();
@@ -362,12 +547,12 @@ impl Project {
                 .clone()
                 .unwrap_or_else(|| node.label()),
             qual: String::new(),
-            kind: node.kind.label().to_string(),
+            kind: node.kind.clone(),
             detail,
             doc: node.doc.as_deref().map(|doc| truncate(doc.trim(), 400)),
             path: Some(rel.to_string()),
             line: Some(cached.lines.line_of(node.span.start)),
-            status: proof_status(node, &cached.source, &cached.lines, &cached.parsed.diagnostics)
+            status: proof_status(node, &cached.lines, &cached.diagnostics())
                 .map(str::to_string),
             child_count: children.len(),
             children,
@@ -689,23 +874,25 @@ impl Project {
     pub fn detail(&mut self, id: &str) -> LeanResult<NodeDetail> {
         match self.resolve(id)? {
             Target::Ast { rel, path } => {
-                let cached = self.load(&rel)?;
+                let cached = self.load(&rel, Parse::Exact)?;
                 let node = cached
                     .parsed
                     .get(&path)
                     .ok_or_else(|| LeanError::msg(format!("node `{id}` no longer exists")))?;
-                let start_line = cached.lines.line_of(node.span.start);
-                let end_line = cached.lines.line_of(node.span.end);
+                let start_line = cached.lines.line_of(node.inner.start);
+                let start_column = utf16_column(&cached.source, cached.lines.start_of(start_line), node.inner.start);
+                let end_line = cached.lines.line_of(node.inner.end);
                 Ok(NodeDetail {
                     id: id.to_string(),
                     label: node.label(),
                     name: node.name.clone(),
                     renamable: node.name_span.is_some(),
-                    kind: node.kind.label().to_string(),
+                    kind: node.kind.clone(),
                     path: Some(rel),
-                    text: slice(&cached.source, node.span),
+                    text: slice(&cached.source, node.inner),
                     editable: true,
                     start_line,
+                    start_column,
                     end_line,
                     doc: node.doc.clone(),
                     comments: node.comments.as_deref().map(bare_comment),
@@ -724,7 +911,7 @@ impl Project {
                 })
             }
             Target::File(rel) | Target::AstGroup(rel) => {
-                let cached = self.load(&rel)?;
+                let cached = self.load(&rel, Parse::Exact)?;
                 Ok(NodeDetail {
                     id: id.to_string(),
                     label: file_name(&rel),
@@ -735,11 +922,12 @@ impl Project {
                     text: cached.source.clone(),
                     editable: true,
                     start_line: 1,
+                    start_column: 0,
                     end_line: cached.lines.line_count(),
                     doc: cached.parsed.module_doc.clone(),
                     comments: None,
                     signature: None,
-                    diagnostics: diagnostics_of(&cached.parsed.diagnostics),
+                    diagnostics: diagnostics_of(&cached.diagnostics()),
                 })
             }
             Target::Lib(name) => {
@@ -758,6 +946,7 @@ impl Project {
                     text: describe_lib(lib),
                     editable: false,
                     start_line: 1,
+                    start_column: 0,
                     end_line: 1,
                     doc: None,
                     comments: None,
@@ -782,6 +971,7 @@ impl Project {
                     text: describe_folder(folder),
                     editable: false,
                     start_line: 1,
+                    start_column: 0,
                     end_line: 1,
                     doc: None,
                     comments: None,
@@ -798,12 +988,12 @@ impl Project {
     pub fn update(&mut self, id: &str, text: &str) -> LeanResult<UpdateResult> {
         let (rel, span) = match self.resolve(id)? {
             Target::Ast { rel, path } => {
-                let cached = self.load(&rel)?;
+                let cached = self.load(&rel, Parse::Exact)?;
                 let node = cached
                     .parsed
                     .get(&path)
                     .ok_or_else(|| LeanError::msg(format!("node `{id}` no longer exists")))?;
-                (rel, Some(node.span))
+                (rel, Some(node.inner))
             }
             Target::File(rel) | Target::AstGroup(rel) => (rel, None),
             _ => {
@@ -826,7 +1016,7 @@ impl Project {
     pub fn update_comments(&mut self, id: &str, text: &str) -> LeanResult<UpdateResult> {
         let (rel, comment_span, node_start, indent, region_start) = match self.resolve(id)? {
             Target::Ast { rel, path } => {
-                let cached = self.load(&rel)?;
+                let cached = self.load(&rel, Parse::Exact)?;
                 let node = cached
                     .parsed
                     .get(&path)
@@ -885,7 +1075,7 @@ impl Project {
         }
         let (rel, span) = match self.resolve(id)? {
             Target::Ast { rel, path } => {
-                let cached = self.load(&rel)?;
+                let cached = self.load(&rel, Parse::Tree)?;
                 let node = cached
                     .parsed
                     .get(&path)
@@ -905,8 +1095,13 @@ impl Project {
     }
 
     fn finish_edit(&mut self, requested: &str, rel: &str) -> LeanResult<UpdateResult> {
-        let cached = self.load(rel)?;
-        let diagnostics = cached.parsed.diagnostics.clone();
+        // The file changed: hand the new text to the language server, which
+        // re-checks it (and only it) in the background.
+        let _ = self.check_file(rel);
+        let cached = self.load(rel, Parse::Tree)?;
+        // `load` has already handed the new text to the server; the diagnostics
+        // it answers with arrive in the background, and the UI polls for them.
+        let diagnostics = cached.diagnostics();
         let detail = match self.detail(requested) {
             Ok(detail) => detail,
             Err(_) => self.detail(&format!("file:{rel}"))?,
@@ -922,6 +1117,7 @@ impl Project {
             stats: view.stats,
             diagnostics: diagnostics_of(&diagnostics),
             ok,
+            processing: self.engine.processing(),
         })
     }
 
@@ -977,7 +1173,7 @@ impl Project {
         let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
         for lib in &libs {
             for file in lib_files(lib) {
-                let cached = self.load(&file.rel)?;
+                let cached = self.load(&file.rel, Parse::Tree)?;
                 let entry = counts.entry(lib.name.clone()).or_insert((0, 0));
                 entry.0 += 1;
                 entry.1 += cached.parsed.node_count();
@@ -1027,7 +1223,7 @@ impl Project {
                 return Err(LeanError::msg("select a file or a declaration first"));
             }
         };
-        let cached = self.load(&rel)?;
+        let cached = self.load(&rel, Parse::Tree)?;
         Ok(printer::print_file(&rel, &cached.source, &cached.parsed))
     }
 
@@ -1040,7 +1236,7 @@ impl Project {
         let mut catalog = logic::Catalog::default();
         for lib in &libs {
             for file in lib_files(lib) {
-                let cached = self.load(&file.rel)?;
+                let cached = self.load(&file.rel, Parse::Tree)?;
                 collect_terms(
                     &cached.parsed.nodes,
                     &[],
@@ -1164,7 +1360,7 @@ impl Project {
     pub fn delete_node(&mut self, id: &str) -> LeanResult<()> {
         let (rel, span) = match self.resolve(id)? {
             Target::Ast { rel, path } => {
-                let cached = self.load(&rel)?;
+                let cached = self.load(&rel, Parse::Tree)?;
                 let node = cached
                     .parsed
                     .get(&path)
@@ -1330,7 +1526,7 @@ fn bare_comment(raw: &str) -> String {
 /// Walks a file and files every declaration the logic board cares about, with
 /// the namespace chain it sits in.
 fn collect_terms(
-    nodes: &[SyntaxNode],
+    nodes: &[AstNode],
     path: &[usize],
     prefix: &str,
     namespaces: &[String],
@@ -1342,7 +1538,7 @@ fn collect_terms(
         let mut child_path = path.to_vec();
         child_path.push(index);
 
-        if node.kind == NodeKind::Namespace {
+        if node.kind == "namespace" {
             let name = node.name.clone().unwrap_or_default();
             let next = join_name(prefix, &name);
             let mut chain = namespaces.to_vec();
@@ -1359,11 +1555,11 @@ fn collect_terms(
             continue;
         }
 
-        let kind = match node.kind {
-            NodeKind::Structure | NodeKind::Class => Some("structure"),
-            NodeKind::Axiom => Some("axiom"),
-            NodeKind::Def | NodeKind::Abbrev | NodeKind::Opaque => Some("def"),
-            NodeKind::Theorem | NodeKind::Lemma => Some("theorem"),
+        let kind = match node.kind.as_str() {
+            "structure" | "class" => Some("structure"),
+            "axiom" => Some("axiom"),
+            "def" | "abbrev" | "opaque" => Some("def"),
+            "theorem" | "lemma" => Some("theorem"),
             _ => None,
         };
         let Some(kind) = kind else {
@@ -1386,22 +1582,20 @@ fn collect_terms(
         });
         let qual = join_name(prefix, &name);
         let id = format!("ast:{}#{}", rel, join_path(&child_path));
-        let text = slice(&cached.source, node.span);
+        let text = slice(&cached.source, node.inner);
         catalog.terms.push(logic::Term {
             key: node_key(kind, rel, Some(&qual), node.span.start),
             id,
             label: name,
             qual: qual.clone(),
             kind,
-            status: proof_status(node, &cached.source, &cached.lines, &cached.parsed.diagnostics)
+            status: proof_status(node, &cached.lines, &cached.diagnostics())
                 .map(str::to_string),
             path: rel.to_string(),
             line: cached.lines.line_of(node.span.start),
             signature: node.signature.clone(),
             namespaces: namespaces.to_vec(),
-            own_name: node
-                .name_span
-                .map(|span| (span.start - node.span.start, span.end - node.span.start)),
+            idents: node.idents.clone(),
             text,
         });
     }
@@ -1415,8 +1609,8 @@ fn node_key(kind: &str, rel: &str, name: Option<&str>, fallback: u32) -> String 
 }
 
 /// Status of a declaration for the graph, when it has one.
-fn proof_status_string(node: &SyntaxNode, cached: &CachedFile) -> Option<String> {
-    proof_status(node, &cached.source, &cached.lines, &cached.parsed.diagnostics)
+fn proof_status_string(node: &AstNode, cached: &CachedFile) -> Option<String> {
+    proof_status(node, &cached.lines, &cached.diagnostics())
         .map(str::to_string)
 }
 
@@ -1485,6 +1679,16 @@ fn file_ref(rel: String) -> FileRef {
     }
 }
 
+/// UTF-16 columns are what LSP counts in, and what a JS textarea reports.
+fn utf16_column(source: &str, line_start: u32, offset: u32) -> u32 {
+    let start = (line_start as usize).min(source.len());
+    let end = (offset as usize).min(source.len());
+    if start > end {
+        return 0;
+    }
+    source[start..end].encode_utf16().count() as u32
+}
+
 fn slice(source: &str, span: Span) -> String {
     let start = (span.start as usize).min(source.len());
     let end = (span.end as usize).min(source.len());
@@ -1512,10 +1716,7 @@ fn diagnostics_of(diagnostics: &[Diagnostic]) -> Vec<DiagnosticDto> {
         .iter()
         .map(|diagnostic| DiagnosticDto {
             line: diagnostic.line,
-            severity: match diagnostic.severity {
-                Severity::Error => "error".to_string(),
-                Severity::Warning => "warning".to_string(),
-            },
+            severity: diagnostic.severity.label().to_string(),
             message: diagnostic.message.clone(),
         })
         .collect()
@@ -1619,7 +1820,7 @@ fn push_file_graph(
         for (index, node) in cached.parsed.nodes.iter().enumerate() {
             // Imports sit in the tree but never in the graph: they are edges
             // between files, not structure inside one.
-            if matches!(node.kind, NodeKind::Import | NodeKind::Prelude) {
+            if is_import(&node.kind) {
                 continue;
             }
             push_ast_graph(&file.rel, &[index], node, &group_id, "", nodes, cached);
@@ -1631,7 +1832,7 @@ fn push_file_graph(
 fn push_ast_graph(
     rel: &str,
     path: &[usize],
-    node: &SyntaxNode,
+    node: &AstNode,
     parent: &str,
     prefix: &str,
     nodes: &mut Vec<GraphNode>,
@@ -1648,12 +1849,12 @@ fn push_ast_graph(
     };
     nodes.push(GraphNode {
         id: id.clone(),
-        key: node_key(node.kind.label(), rel, key_name.as_deref(), node.span.start),
+        key: node_key(&node.kind, rel, key_name.as_deref(), node.span.start),
         label: node
             .name
             .clone()
             .unwrap_or_else(|| truncate(&node.label(), 44)),
-        kind: node.kind.label().to_string(),
+        kind: node.kind.clone(),
         parent: Some(parent.to_string()),
         child_count: node.children.len(),
         expanded: false,
@@ -1663,7 +1864,7 @@ fn push_ast_graph(
         status: proof_status_string(node, cached),
         detail: None,
     });
-    let child_prefix = if node.kind == NodeKind::Namespace {
+    let child_prefix = if node.kind == "namespace" {
         qualified
     } else {
         prefix.to_string()
@@ -1893,31 +2094,29 @@ fn build_folder(rel: String, name: String, files: Vec<FileRef>) -> Folder {
 
 // ------------------------------------------------------------------ status --
 
-/// Heuristic proof state of a theorem/lemma: a structural error inside the node,
-/// `sorry`/`admit` in the body, or nothing left open (reported as proven).
-/// KLEAN does not elaborate, so this reads the source, it does not type check.
-fn proof_status(
-    node: &SyntaxNode,
-    source: &str,
-    lines: &LineIndex,
-    diagnostics: &[Diagnostic],
-) -> Option<&'static str> {
-    if !matches!(node.kind, NodeKind::Theorem | NodeKind::Lemma) {
+/// Proof state of a theorem, from what Lean itself reported: an error inside
+/// the node means it does not compile, a `sorry` warning means it is admitted,
+/// and anything else was checked by the kernel.
+fn proof_status(node: &AstNode, lines: &LineIndex, diagnostics: &[Diagnostic]) -> Option<&'static str> {
+    if !matches!(node.kind.as_str(), "theorem" | "lemma") {
         return None;
     }
     let start = lines.line_of(node.span.start);
     let end = lines.line_of(node.span.end);
-    let broken = diagnostics.iter().any(|diagnostic| {
-        diagnostic.severity == Severity::Error && diagnostic.line >= start && diagnostic.line <= end
-    });
-    if broken {
+    let inside: Vec<&Diagnostic> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.line >= start && diagnostic.line <= end)
+        .collect();
+    if inside.iter().any(|d| d.severity == Severity::Error) {
         return Some("error");
     }
-    let text = slice(source, node.span);
-    let open = tokenize(&text).iter().any(|token| {
-        token.kind == TokenKind::Ident && matches!(token.text(&text), "sorry" | "admit")
-    });
-    Some(if open { "sorry" } else { "proven" })
+    if inside.iter().any(|d| {
+        d.severity == Severity::Warning
+            && (d.message.contains("sorry") || d.message.contains("admit"))
+    }) {
+        return Some("sorry");
+    }
+    Some("proven")
 }
 
 // ------------------------------------------------------------------- logic --
@@ -1982,4 +2181,155 @@ fn indent_of(source: &str, offset: u32) -> String {
         .chars()
         .take_while(|character| character.is_whitespace())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("klean-test-{name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Demo")).expect("project dir");
+        std::fs::write(
+            root.join("lakefile.toml"),
+            "name = \"demo\"\n\n[[lean_lib]]\nname = \"Demo\"\n",
+        )
+        .expect("lakefile");
+        std::fs::write(root.join("lean-toolchain"), "leanprover/lean4:stable\n")
+            .expect("toolchain file");
+        std::fs::write(root.join("Demo.lean"), "import Demo.Basic\n").expect("root module");
+        std::fs::write(
+            root.join("Demo/Basic.lean"),
+            "/-!\n  Demo basic.\n-/
+
+-- a plain note
+/-- Twice a number. -/
+def two : Nat := 2
+
+theorem t : two = 2 := rfl
+
+/-- Still to do. -/
+theorem todo : two = 3 := by sorry
+",
+        )
+        .expect("module");
+        root
+    }
+
+    /// Waits for the language server to finish the project, so the diagnostics
+    /// it publishes are the ones the assertions look at.
+    fn settle(project: &mut Project) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        // Give the worker a moment to open the documents first.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        while project.lean_processing() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // The server publishes as it finishes each file; give the last batch time
+        // to land before anything is read back.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+
+    /// A whole project read through Lean's parser, plus edits and renames.
+    #[test]
+    fn reads_and_edits_a_project_through_lean() {
+        let root = scratch("project");
+        let app_data = std::env::temp_dir().join("klean-test-appdata");
+        let mut project = match Project::open(&root, &app_data) {
+            Ok(project) => project,
+            Err(error) => {
+                eprintln!("cannot open the project without Lean: {error}");
+                return;
+            }
+        };
+        let view = project.view().expect("view");
+        let lib = view.tree.first().expect("a library");
+        assert_eq!(lib.kind, "lib");
+        let file = find_file(lib, "Demo/Basic.lean").expect("the module");
+        let kinds: Vec<&str> = file.children.iter().map(|node| node.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["def", "theorem", "theorem"],
+            "tree from Lean's parser"
+        );
+        let def = &file.children[0];
+        assert_eq!(def.label, "two");
+        assert_eq!(def.doc.as_deref(), Some("Twice a number."));
+        assert!(def.status.is_none(), "a def has no proof state");
+
+        // The modal's text is the command, without its doc comment.
+        let id = def.id.clone();
+        let detail = project.detail(&id).expect("detail");
+        assert_eq!(detail.text, "def two : Nat := 2");
+        assert_eq!(detail.comments.as_deref(), Some("a plain note"));
+        assert!(detail.renamable);
+
+        // Opening a file is what asks Lean about it: the editor calls this, and the
+        // server checks it in the background.
+        project.check_file("Demo/Basic.lean").expect("check");
+        settle(&mut project);
+        let view = project.view().expect("view");
+        let file = find_file(view.tree.first().expect("lib"), "Demo/Basic.lean").expect("module");
+        assert_eq!(file.children[1].status.as_deref(), Some("proven"));
+        // The `sorry` badge can only come from Lean: it is the server's warning.
+        assert_eq!(
+            file.children[2].status.as_deref(),
+            Some("sorry"),
+            "Lean's `declaration uses 'sorry'` warning"
+        );
+        let detail = project.detail(&format!("file:{}", "Demo/Basic.lean")).expect("detail");
+        assert!(
+            detail.diagnostics.iter().all(|diagnostic| diagnostic.severity != "error"),
+            "no errors: {:?}",
+            detail.diagnostics
+        );
+        assert!(
+            detail
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("sorry")),
+            "the server reported the `sorry`: {:?}",
+            detail.diagnostics
+        );
+        assert!(project.lean_status().server, "the language server is running");
+
+        // Editing splices exactly the node's span and writes the file back.
+        let result = project.update(&id, "def two : Nat := 1 + 1").expect("update");
+        assert_eq!(result.detail.text, "def two : Nat := 1 + 1");
+        let source = std::fs::read_to_string(root.join("Demo/Basic.lean")).expect("file");
+        assert!(source.contains("def two : Nat := 1 + 1"));
+        assert!(source.contains("/-- Twice a number. -/"), "doc kept");
+
+        // The comments box rewrites the plain comments above the declaration.
+        let commented = project
+            .update_comments(&id, "first note\nsecond note")
+            .expect("comments");
+        assert_eq!(
+            commented.detail.comments.as_deref(),
+            Some("first note\nsecond note")
+        );
+        let source = std::fs::read_to_string(root.join("Demo/Basic.lean")).expect("file");
+        assert!(source.contains("-- first note\n-- second note"), "{source}");
+        assert!(source.contains("/-- Twice a number. -/"), "doc kept");
+
+        // Renaming rewrites the name token only.
+        let renamed = project.rename(&id, "three").expect("rename");
+        assert_eq!(renamed.detail.name.as_deref(), Some("three"));
+        let source = std::fs::read_to_string(root.join("Demo/Basic.lean")).expect("file");
+        assert!(source.contains("def three : Nat := 1 + 1"));
+    }
+
+    /// Finds a file node by path in the workspace tree.
+    fn find_file<'a>(node: &'a TreeNode, rel: &str) -> Option<&'a TreeNode> {
+        if node.kind == "file" && node.path.as_deref() == Some(rel) {
+            return Some(node);
+        }
+        for child in &node.children {
+            if let Some(found) = find_file(child, rel) {
+                return Some(found);
+            }
+        }
+        None
+    }
 }

@@ -112,6 +112,14 @@ impl ProjectFs {
         self.origin.as_deref()
     }
 
+    /// The file on disk behind a project-relative path, for the tools that run
+    /// outside the VFS (Lean reads its files itself).
+    pub fn absolute(&self, rel: &str) -> Option<PathBuf> {
+        self.origin
+            .as_ref()
+            .map(|root| root.join(rel.trim_start_matches('/')))
+    }
+
     pub fn root(&self) -> &VfsPath {
         &self.root
     }

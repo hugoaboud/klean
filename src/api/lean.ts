@@ -35,6 +35,8 @@ export interface NodeDetail {
   text: string;
   editable: boolean;
   start_line: number;
+  /** 0-based UTF-16 column of the node's first character on `start_line`. */
+  start_column: number;
   end_line: number;
   doc: string | null;
   /** Plain comments above the node, editable. */
@@ -112,6 +114,8 @@ export interface UpdateResult {
   stats: Stats;
   diagnostics: DiagnosticDto[];
   ok: boolean;
+  /** True while the language server is still checking the file. */
+  processing: boolean;
 }
 
 export const openProject = (path: string) =>
@@ -213,7 +217,7 @@ export interface LogicGraph {
 export interface SettingNode {
   id: string;
   label: string;
-  kind: "group" | "bool" | "enum" | "text";
+  kind: "group" | "bool" | "enum" | "text" | "action";
   value: string;
   options: string[];
   help: string;
@@ -282,6 +286,77 @@ export const saveCamera = (graph: string, camera: Camera) =>
 
 export const saveLinkBend = (graph: string, key: string, value: number | null) =>
   invoke<void>("save_link_bend", { graph, key, value });
+
+/** Lean as this project sees it: the toolchain, the build, the last failure. */
+export interface LeanStatus {
+  /** Lean integration switched on in settings. */
+  enabled: boolean;
+  /** A toolchain was found. */
+  available: boolean;
+  /** `system`, `elan`, `managed` or `custom`. */
+  origin: string;
+  /** `Lean (version 4.35.0, …)`. */
+  version: string;
+  lean: string | null;
+  /** Why Lean cannot be used, when it cannot. */
+  error: string | null;
+  /** `folder`, `archive` or `memory`: only folders can run Lean. */
+  backend: string;
+  /** The project is a Lake package. */
+  lake: boolean;
+  /** The in-process parser is ready. */
+  parser: boolean;
+  /** The language server is running. */
+  server: boolean;
+  /** Files the server is still working on (project-relative paths). */
+  processing: string[];
+  building: boolean;
+  /** Last `lake build` outcome, one line. */
+  build: string | null;
+}
+
+/** Proof goals at one position, as Lean's language server renders them. */
+export interface Goals {
+  goals: string[];
+  rendered: string;
+  /** Shown when there is no goal at the position. */
+  note: string | null;
+}
+
+export const leanStatus = () => invoke<LeanStatus>("lean_status");
+
+/** The build console: the tail of `lake build`'s output and how it stands. */
+export interface BuildState {
+  running: boolean;
+  /** The command being run, for the console header. */
+  command: string;
+  /** Output lines, oldest first. */
+  lines: string[];
+  /** One-line verdict once the build is over. */
+  summary: string | null;
+  failed: boolean;
+  /** Seconds since the build started. */
+  seconds: number;
+}
+
+/** Starts `lake build` in the background and returns immediately. */
+export const leanBuild = () => invoke<BuildState>("lean_build");
+
+/** The console's current contents. */
+export const leanBuildState = () => invoke<BuildState>("lean_build_state");
+
+/** Stops a running build. */
+export const leanBuildCancel = () => invoke<BuildState>("lean_build_cancel");
+
+/** Asks Lean to check one file in the background. */
+export const leanCheckFile = (id: string) => invoke<void>("lean_check_file", { id });
+
+/** Goals at a position: 1-based line, 0-based UTF-16 column. */
+export const leanGoals = (id: string, line?: number, character?: number) =>
+  invoke<Goals>("lean_goals", { id, line: line ?? null, character: character ?? null });
+
+/** Downloads elan + the configured channel; resolves with the `lean` path. */
+export const leanInstall = () => invoke<string>("lean_install");
 
 
 export const updateComments = (id: string, text: string) =>

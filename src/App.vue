@@ -6,6 +6,8 @@ import { actions, state } from "./store/workspace";
 
 onMounted(() => {
   void actions.bootstrap();
+  // Toolchain installs report progress from Rust as they download.
+  void actions.listen();
 });
 </script>
 

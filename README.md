@@ -26,9 +26,8 @@ The bottom **snackbar** switches the board between two views:
 
 - **AST** — the graph and tree described above. Files can be created (the prompt starts in
   the selected file's folder) and deleted from the tree header; theorem rows carry a proof
-  state: green check (no `sorry`), amber warning (`sorry`/`admit` in the body) or red mark
-  (structural error). This is read from the source — KLEAN does not elaborate, so it is a
-  signal, not a proof.
+  state that Lean itself reported: green check (checked, no `sorry`), amber warning (Lean's
+  `declaration uses 'sorry'` message) or red mark (an error inside the declaration).
 - **Logic** — the same board shape (graph left, tree right, movable divider), but the
   tree lists only axioms, definitions and theorems, grouped by namespace, and the graph's
   squares are those namespaces instead of files. Edges are *uses*: an identifier in one
@@ -57,6 +56,9 @@ Interaction, on either board:
 - the modal marks every diagnostic line with an icon in the gutter and a soft line wash,
   lists only the diagnostics that fall inside the node, and offers a comments box that
   writes plain `--` comments back above the declaration
+- the right-hand column of the modal is what Lean says about the node: the **proof state**
+  (the goals left at the caret, asked of Lean's language server) and the **diagnostics**
+  inside the node, worst first
 - `.klean.json` is the project file: graph positions, the camera of each board, hidden
   logic items and the project settings. Writes are batched — dragging updates memory and
   the file is rewritten at most every five seconds (and whenever the project is switched)
@@ -87,8 +89,12 @@ describe the sections, and can save it as a `.lean` file.
 
 - Rust (stable) and the Tauri prerequisites for your platform
 - Node 20+ and npm
-- No Lean toolchain: parsing is done in Rust, so KLEAN works without Lean or lake
-  installed.
+- **A Lean 4 toolchain** for everything that touches Lean: the syntax tree, the
+  diagnostics and the goals. KLEAN does not parse Lean itself, so it needs a real one —
+  either the `lean`/`lake` on your `PATH` (elan, or a manual install) or a toolchain
+  installed from *Settings → Lean* (the app downloads elan and the channel you pick).
+  Archives and in-memory workspaces are browsable but cannot be checked: Lean needs a
+  folder with a `lakefile` to run in.
 
 ## Running
 
@@ -127,14 +133,26 @@ rm -rf ~/.local/share/com.aboud.klean
 ## Layout
 
 ```
+lean4-ast/                   Lean's own parser, as a static library + Rust crate
+  build.py                   pulls the pinned lean4 tag, extracts it, builds the
+                             library and runs the crate's tests
+  manifest.json              which lean4 files matter, and why (verified by build.py)
+  wrapper/KleanAst.lean      thin wrapper: Lean.Parser → JSON syntax tree
+  shim/klean_ast_shim.c      starts the Lean runtime, exposes three C functions
+  crates/klean-ast/          the Rust API and its per-feature tests
 src-tauri/src/lean/          the engine (no UI concerns)
   fs.rs                      project storage on rust-vfs: PhysicalFS on disk,
                              MemoryFS for archives, zip import/export, ignored dirs
-  syntax/lexer.rs            Lean 4 tokenizer (comments, doc comments, strings,
-                             escaped and dotted names, brackets)
-  syntax/ast.rs              syntax tree types: spans, node kinds, doc comments
-  syntax/parser.rs           structural parser: commands, namespaces, sections,
-                             structure fields, inductive constructors, where blocks
+  toolchain.rs               finds the `lean`/`lake` to use (PATH, elan, settings, or
+                             the one KLEAN installs through elan), runs `lake env` and
+                             `lake serve`, downloads elan on request
+  bridge.rs                  keeps the Lean syntax helper alive and talks to it
+  lsp.rs                     the language server on a worker thread: diagnostics,
+                             processing progress, `$/lean/plainGoal`, incremental edits
+  engine.rs                  one project's Lean: toolchain, parser, server, status
+  ast.rs                     the syntax model the board renders, plus the rules that
+                             turn Lean's syntax tree into rows (block nesting,
+                             comments above a node, signature slicing)
   project.rs                 lakefile discovery, Lib/Folder/File model, node ids,
                              tree/graph DTOs, detail lookup, edits, write-back
   printer.rs                 human-readable Lean printer with outline comments
@@ -148,19 +166,80 @@ All project logic lives in Rust. Vue owns only presentation and view state (whic
 is visible, whether the modal is open, which tree rows are unfolded, split ratio, graph
 expansion is *not* view state — Rust owns it).
 
-## How the parser works
+## How Lean is used
 
-Lean has no command terminator: a command ends where the next one begins. The parser
-splits a file at command starts, detected as a command keyword (or an attribute/modifier
-run such as `@[simp] private`) at the top bracket level of the current block, at the
-start of a line, and not indented deeper than the command it would otherwise continue.
-`namespace`, `section` and `mutual` blocks nest until their `end`.
+KLEAN contains no Lean parser. Everything the board shows is what the official
+implementation reported:
 
-This is a *structural* tree, not an elaborated Lean `Syntax` tree: expressions, proofs
-and tactic blocks are kept verbatim, which is what makes editing safe — an edit replaces
-exactly the node's byte span and leaves everything around it untouched. Diagnostics
-report structural problems only (unbalanced brackets, missing `end`); no type checking
-happens here.
+- **syntax tree** — `lean4-ast/` builds Lean's *parser* into a static library that KLEAN
+  links: `Lean.Parser.parseHeader` + `parseCommand`, no elaboration. Parsing a file is a
+  library call in this process (microseconds), so no project file ever spawns a process.
+  A file is parsed twice when it imports something — once to read the imports, once with
+  their syntax extensions loaded — and if an import has not been built yet the tree falls
+  back to core syntax instead of disappearing.
+- **diagnostics and proof goals** — `lake serve` (or `lean --server` outside a Lake
+  package) is the only process KLEAN runs. It stays up for the whole project, on a worker
+  thread, with incremental `didChange`s; the board reads the diagnostics and the processing
+  progress it publishes, and the modal asks `$/lean/plainGoal` for the caret position. No
+  UI call waits for Lean: the board shows *checking …* at the top right while the server
+  works, and the modal says the same for the file it has open.
+- **build** — `lake build` makes the project's `.olean` files, which is what lets a file
+  see its imports — for the parser's syntax extensions and for the server's checks alike.
+
+The tree KLEAN builds from those records is *structural*, like the sources: expressions and
+proofs stay verbatim, so an edit replaces exactly a node's byte span and leaves everything
+around it untouched. `namespace`/`section`/`mutual` blocks are nested by pairing their
+commands with the matching `end`, and doc/plain comments are recovered from the text
+between one command and the next (Lean's tree does not carry them).
+
+### What opening a project costs
+
+Nothing runs until you ask. Opening a project reads the file list and parses it with **one**
+Lean environment (`Init`/`Lean`): no project module is loaded, so memory does not grow with
+the project. Measured here: 150 files and 600 files both open at ~210 MB, and no Lean
+process is started.
+
+- **Parsing** a whole project is microseconds per file. Only the file you open in the editor
+  is re-parsed with *its* imports loaded, and only once the project has been built; the
+  parser keeps at most two such environments, so a session cannot accumulate them.
+- **Checking** is per file: opening a node hands that one file to the language server, which
+  keeps its own process and reports diagnostics as it finds them. Editing a node sends only
+  that file's change (one replaced range) and re-checks only that file; the rest of the
+  project is untouched, so typing stays responsive no matter how large the project is.
+- **The welcome page does nothing**: no parsing, no server, no build — the binary sits at
+  ~200 MB and no Lean process exists until a project is opened.
+- **Building** is the one expensive action, so it is a question, not a side effect: when a
+  project opens KLEAN asks whether to run `lake build` (the *Lean → Build on open* setting
+  can answer `ask`, `always` or `never`). A build runs in the background with a console that
+  streams `lake build`'s own output, a cancel button, and an address-space ceiling
+  (*Lean → build memory*, `auto` by default) so a runaway build fails instead of taking the
+  machine with it.
+
+The parser library is pinned to one Lean version (its static link can only read that
+version's `.olean` files), so KLEAN resolves a toolchain of exactly that version — the one
+`lean4-ast/build.py` built with, or an installed elan toolchain of the same version — and
+says so plainly when there is none.
+
+KLEAN's library is built as `staticlib` + `rlib`, never `cdylib`: Lean's runtime uses
+initial-exec TLS, which a shared library cannot carry. That is also why a mobile build of
+this app would need its own parser story.
+
+### The Lean settings
+
+`Settings → Lean` (the settings tree lives in `src-tauri/src/lean/settings.rs`):
+
+- **Use Lean** — off leaves the board read-only: files are listed, nothing is checked
+- **Toolchain** — `auto` (the `lean` on PATH, then elan homebrew spots), `managed` (the one
+  KLEAN installed), or `custom` with a path
+- **toolchain override** — an elan channel such as `leanprover/lean4:stable`, or empty to
+  use the project's `lean-toolchain`
+- **install channel** and **Install toolchain** — downloads the elan release into the app
+  data directory and installs that channel (~200 MB), then switches the toolchain to
+  `managed`. Progress lines appear on the button.
+- **Build on open** — `ask` (default), `always` or `never`; a build always streams into its
+  console
+- **build memory** — address-space ceiling for `lake build` (`auto` = the machine's memory)
+- **timeout (s)** — how long one file may take before Lean is restarted
 
 ## Storage
 
