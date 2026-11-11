@@ -1,0 +1,326 @@
+/* =========================================================================
+   KLEAN design system
+   Dark, professional, almost-sharp corners, discreet gradients between
+   neighbouring dark grays, comfortably small fonts, quiet motion.
+   ========================================================================= */
+
+:root {
+  color-scheme: dark;
+
+  /* Surfaces: one step apart, never more. */
+  --bg-0: #0a0b0c;
+  --bg-1: #0f1112;
+  --bg-2: #141618;
+  --bg-3: #191c1e;
+  --bg-4: #1e2225;
+  --bg-hover: #1b1f22;
+  --bg-active: #22272b;
+
+  /* Hairlines */
+  --line: #23282b;
+  --line-soft: #1a1e21;
+  --line-strong: #2e3439;
+
+  /* Text */
+  --text: #d4dade;
+  --text-dim: #99a2a9;
+  --text-faint: #6b757c;
+  --text-ghost: #4c555a;
+
+  /* Accent: muted steel blue */
+  --accent: #6aa9c4;
+  --accent-bright: #93cbe0;
+  --accent-soft: rgba(106, 169, 196, 0.13);
+  --accent-line: rgba(106, 169, 196, 0.36);
+
+  --danger: #c9736b;
+  --danger-soft: rgba(201, 115, 107, 0.12);
+  --warning: #c2a670;
+  --warning-soft: rgba(194, 166, 112, 0.12);
+  --ok: #7cab88;
+  --ok-soft: rgba(124, 171, 136, 0.12);
+
+  /* Geometry */
+  --radius: 3px;
+  --radius-lg: 4px;
+
+  /* Type */
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
+  --mono: "JetBrains Mono", "SFMono-Regular", ui-monospace, Menlo, Consolas,
+    monospace;
+  --fs-micro: 10px;
+  --fs-xs: 10.5px;
+  --fs-sm: 11.5px;
+  --fs-md: 12.5px;
+  --fs-lg: 14px;
+
+  /* Motion */
+  --t-fast: 110ms;
+  --t: 160ms;
+  --t-slow: 240ms;
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Gradients used for surfaces, kept very discreet */
+  --grad-panel: linear-gradient(180deg, #131618 0%, #101213 100%);
+  --grad-raised: linear-gradient(180deg, #1d2124 0%, #181b1e 100%);
+  --grad-header: linear-gradient(180deg, #171a1d 0%, #131618 100%);
+  --grad-accent: linear-gradient(180deg, rgba(106, 169, 196, 0.16), rgba(106, 169, 196, 0.06));
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font);
+  font-size: var(--fs-md);
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg-0);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--accent-bright);
+}
+
+/* Scrollbars: thin, unobtrusive */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2b3136 transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: #262b2f;
+  border: 2px solid transparent;
+  background-clip: content-box;
+  border-radius: 6px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #343a3f;
+  background-clip: content-box;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+input,
+textarea {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  outline: none;
+}
+
+/* Shared primitives -------------------------------------------------------- */
+
+.k-label {
+  font-size: var(--fs-micro);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.k-mono {
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  font-variant-ligatures: none;
+}
+
+.k-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.k-spacer {
+  flex: 1;
+}
+
+/* Kind badges used by the tree and the graph legend */
+.k-kind {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 15px;
+  height: 14px;
+  padding: 0 4px;
+  border-radius: 2px;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.02em;
+  color: var(--text-faint);
+  background: #1c2023;
+  border: 1px solid var(--line-soft);
+  transition: color var(--t) var(--ease), border-color var(--t) var(--ease);
+}
+
+.k-kind[data-kind="lib"] {
+  color: var(--accent);
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+
+.k-kind[data-kind="folder"] {
+  color: #a3aeb6;
+  border-color: #2c3236;
+}
+
+.k-kind[data-kind="file"] {
+  color: #b6c0c7;
+  border-color: #2c3236;
+  background: #1a1e21;
+}
+
+.k-kind[data-kind="astgroup"] {
+  color: var(--text-faint);
+  border-style: dashed;
+}
+
+.k-kind[data-kind="def"],
+.k-kind[data-kind="abbrev"],
+.k-kind[data-kind="opaque"] {
+  color: #8fb8a4;
+}
+
+.k-kind[data-kind="theorem"],
+.k-kind[data-kind="lemma"],
+.k-kind[data-kind="example"] {
+  color: #a8a0cf;
+}
+
+.k-kind[data-kind="structure"],
+.k-kind[data-kind="class"],
+.k-kind[data-kind="inductive"] {
+  color: #c9a96b;
+}
+
+.k-kind[data-kind="instance"],
+.k-kind[data-kind="deriving"],
+.k-kind[data-kind="attribute"] {
+  color: #c58e7a;
+}
+
+.k-kind[data-kind="namespace"],
+.k-kind[data-kind="section"],
+.k-kind[data-kind="mutual"] {
+  color: var(--accent-bright);
+}
+
+.k-kind[data-kind="import"],
+.k-kind[data-kind="prelude"],
+.k-kind[data-kind="open"],
+.k-kind[data-kind="export"] {
+  color: #7d8b94;
+}
+
+.k-kind[data-kind="variable"],
+.k-kind[data-kind="universe"],
+.k-kind[data-kind="set_option"],
+.k-kind[data-kind="syntax"],
+.k-kind[data-kind="macro"],
+.k-kind[data-kind="macro_rules"],
+.k-kind[data-kind="notation"],
+.k-kind[data-kind="elab"] {
+  color: #8b96a0;
+}
+
+.k-kind[data-kind="field"],
+.k-kind[data-kind="constructor"],
+.k-kind[data-kind="where"] {
+  color: #7f8f9a;
+}
+
+/* Focus ring, discreet */
+:focus-visible {
+  outline: 1px solid var(--accent-line);
+  outline-offset: 1px;
+}
+
+/* Syntax highlighting (highlight.js theme, matched to the palette) --------- */
+
+.hljs-comment,
+.hljs-quote {
+  color: #5c666c;
+  font-style: italic;
+}
+
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal {
+  color: #8fa6c0;
+}
+
+.hljs-built_in,
+.hljs-type {
+  color: #c9a96b;
+}
+
+.hljs-name,
+.hljs-title,
+.hljs-function .hljs-title {
+  color: #a8c8b4;
+}
+
+.hljs-string,
+.hljs-meta .hljs-string {
+  color: #9fb08a;
+}
+
+.hljs-number {
+  color: #c2a08a;
+}
+
+.hljs-symbol,
+.hljs-operator {
+  color: #9aa6ae;
+}
+
+.hljs-attr,
+.hljs-attribute {
+  color: #c58e7a;
+}
+
+.hljs-meta {
+  color: #7e8b93;
+}
+
+.hljs-variable,
+.hljs-params {
+  color: var(--text);
+}
+
+.hljs-section,
+.hljs-emphasis {
+  font-style: italic;
+}

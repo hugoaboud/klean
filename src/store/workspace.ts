@@ -1,0 +1,722 @@
+// Reactive application state.
+//
+// This is a thin shell: every value here comes from Rust, every mutation is a
+// Rust command. The only thing the front-end owns is which page is visible,
+// whether the editor modal is open, and which board view is selected.
+
+import { reactive } from "vue";
+import * as api from "../api/lean";
+
+export type Page = "welcome" | "project";
+export type BoardView = "ast" | "logic";
+
+export interface Printed {
+  title: string;
+  subtitle: string;
+  text: string;
+}
+
+interface State {
+  page: Page;
+  boardView: BoardView;
+  busy: string | null;
+  error: string | null;
+  notice: string | null;
+  view: api.WorkspaceView | null;
+  graph: api.ProjectGraph | null;
+  logic: api.LogicGraph | null;
+  /** Theory whose graph is open; empty means the root graph. */
+  openTheory: string;
+  recents: api.RecentProject[];
+  selectedIds: string[];
+  selectedId: string | null;
+  detail: api.NodeDetail | null;
+  editorOpen: boolean;
+  saving: boolean;
+  saveError: string | null;
+  printed: Printed | null;
+  printedOpen: boolean;
+  settings: api.SettingNode[];
+  settingsOpen: boolean;
+  /** Details of the node under the pointer, for the graph's info card. */
+  hover: api.NodeDetail | null;
+}
+
+export const state = reactive<State>({
+  page: "welcome",
+  boardView: "ast",
+  busy: null,
+  error: null,
+  notice: null,
+  view: null,
+  graph: null,
+  logic: null,
+  openTheory: "",
+  recents: [],
+  selectedIds: [],
+  selectedId: null,
+  detail: null,
+  editorOpen: false,
+  saving: false,
+  saveError: null,
+  printed: null,
+  printedOpen: false,
+  settings: [],
+  settingsOpen: false,
+  hover: null,
+});
+
+async function run<T>(label: string, action: () => Promise<T>): Promise<T | null> {
+  state.busy = label;
+  state.error = null;
+  try {
+    return await action();
+  } catch (error) {
+    state.error = error instanceof Error ? error.message : String(error);
+    return null;
+  } finally {
+    state.busy = null;
+  }
+}
+
+function setSelection(ids: string[]) {
+  state.selectedIds = ids;
+  state.selectedId = ids.length === 1 ? ids[0] : null;
+}
+
+/** Only real source nodes have a detail; namespace/section ids do not. */
+const DETAILABLE = /^(ast|file|lib|dir|astgrp):/;
+
+async function loadDetail(id: string) {
+  const detail = await run("detail", () => api.nodeDetail(id));
+  if (detail) state.detail = detail;
+}
+
+function adopt(view: api.WorkspaceView) {
+  state.view = view;
+  state.boardView = "ast";
+  setSelection([]);
+  state.detail = null;
+  state.editorOpen = false;
+  state.saveError = null;
+  state.printed = null;
+  state.printedOpen = false;
+  state.logic = null;
+  state.openTheory = "";
+  state.page = "project";
+  void loadSettings();
+}
+
+async function loadGraph() {
+  const graph = await run("graph", () => api.graphView());
+  if (graph) state.graph = graph;
+}
+
+async function loadSettings() {
+  const tree = await run("settings", () => api.settingsView());
+  if (tree) state.settings = tree;
+}
+
+async function loadLogic() {
+  const logic = await run("logic", () => api.logicGraph(state.openTheory || null));
+  if (!logic) return;
+  const view = overlay(logic);
+  // A theory that no longer exists drops the board back to the root.
+  state.openTheory = view.trail.length > 1 ? (view.trail[view.trail.length - 1]?.key ?? "") : "";
+  state.logic = view;
+}
+
+async function loadRecents() {
+  try {
+    state.recents = await api.recentProjects();
+  } catch {
+    state.recents = [];
+  }
+}
+
+/** True when `AI → Enable AI Features` is switched on. */
+export function aiEnabled(): boolean {
+  const walk = (nodes: api.SettingNode[]): string | null => {
+    for (const node of nodes) {
+      if (node.id === "ai.enabled") return node.value;
+      const inner = walk(node.children);
+      if (inner !== null) return inner;
+    }
+    return null;
+  };
+  return walk(state.settings) === "true";
+}
+
+/** Writes are batched: `.klean.json` is rewritten at most every 5 seconds. */
+const FLUSH_MS = 5000;
+const pending: {
+  positions: Record<string, api.FixedNode[]>;
+  camera: Record<string, api.Camera>;
+} = { positions: {}, camera: {} };
+let flushTimer: number | null = null;
+/** Guards against an older hover response overwriting a newer one. */
+let hoverSeq = 0;
+let flushAgain = false;
+
+function mergePositions(
+  current: api.FixedNode[] | undefined,
+  next: api.FixedNode[],
+): api.FixedNode[] {
+  const merged = new Map((current ?? []).map((entry) => [entry.id, entry]));
+  for (const entry of next) merged.set(entry.id, entry);
+  return [...merged.values()];
+}
+
+/** Mirrors drag results into the loaded graph so a redraw keeps them. */
+/**
+ * Re-reads both boards. Pages never keep their own copy of a board, so the AST
+ * and the logic view can never disagree after an edit.
+ */
+async function reloadBoards() {
+  const [graph, logic] = await Promise.all([
+    api.graphView(),
+    api.logicGraph(state.openTheory || null),
+  ]);
+  state.graph = graph;
+  state.logic = overlay(logic);
+}
+
+/**
+ * The logic graph as the user sees it: positions dragged less than a flush ago
+ * only live in this tab, so a fresh graph from Rust would otherwise snap nodes
+ * back to their last saved spot.
+ */
+function overlay(graph: api.LogicGraph): api.LogicGraph {
+  const entries = pending.positions[graph.graph];
+  if (!entries || entries.length === 0) return graph;
+  const byKey = new Map(entries.map((entry) => [entry.id, entry]));
+  return {
+    ...graph,
+    nodes: graph.nodes.map((node) => {
+      const moved = byKey.get(node.key);
+      return moved ? { ...node, x: moved.x, y: moved.y } : node;
+    }),
+  };
+}
+
+/** Graph key the board's positions are stored under. */
+function graphKey(board: "ast" | "logic"): string {
+  if (board === "ast") return "ast";
+  return state.logic?.graph ?? "logic";
+}
+
+function applyPositions(board: "ast" | "logic", positions: api.FixedNode[]) {
+  const byKey = new Map(positions.map((entry) => [entry.id, entry]));
+  const update = (nodes: api.GraphNode[]) =>
+    nodes.map((node) => {
+      const moved = byKey.get(node.key);
+      return moved ? { ...node, x: moved.x, y: moved.y } : node;
+    });
+  if (board === "ast" && state.graph) {
+    state.graph = { ...state.graph, nodes: update(state.graph.nodes) };
+  }
+  if (board === "logic" && state.logic) {
+    state.logic = { ...state.logic, nodes: update(state.logic.nodes) };
+  }
+}
+
+function scheduleFlush() {
+  if (flushTimer !== null) return;
+  flushTimer = window.setTimeout(() => {
+    flushTimer = null;
+    void flushPending();
+  }, FLUSH_MS);
+}
+
+async function flushPending() {
+  if (flushTimer !== null) {
+    // A write is already scheduled; it will pick these up.
+    flushAgain = true;
+    return;
+  }
+  const positions = pending.positions;
+  const camera = pending.camera;
+  pending.positions = {};
+  pending.camera = {};
+
+  for (const [graph, entries] of Object.entries(positions)) {
+    if (entries.length > 0) await run("layout", () => api.savePositions(graph, entries));
+  }
+  for (const [graph, value] of Object.entries(camera)) {
+    await run("layout", () => api.saveCamera(graph, value));
+  }
+  if (flushAgain) {
+    flushAgain = false;
+    scheduleFlush();
+  }
+}
+
+if (typeof window !== "undefined") {
+  // Do not lose the last few seconds of dragging when the window goes away.
+  window.addEventListener("beforeunload", () => {
+    void flushPending();
+  });
+}
+
+export const actions = {
+  /** Adopts a project Rust already has open (e.g. given on the command line). */
+  async bootstrap() {
+    await loadRecents();
+    try {
+      const view = await api.workspaceView();
+      state.view = view;
+      state.page = "project";
+      await loadGraph();
+      await loadSettings();
+      // A board that starts on the logic view needs its graph loaded too.
+      if (state.boardView === "logic") await loadLogic();
+    } catch {
+      state.page = "welcome";
+    }
+  },
+
+  async loadRecents() {
+    await loadRecents();
+  },
+
+  async openFolder(path: string) {
+    await flushPending();
+    const view = await run("open", () => api.openProject(path));
+    if (!view) return;
+    adopt(view);
+    await Promise.all([loadGraph(), loadRecents()]);
+  },
+
+  async openZip(path: string) {
+    await flushPending();
+    const view = await run("open", () => api.openProjectZip(path));
+    if (!view) return;
+    adopt(view);
+    await Promise.all([loadGraph(), loadRecents()]);
+  },
+
+  async openRecent(entry: api.RecentProject) {
+    if (entry.kind === "zip") await actions.openZip(entry.path);
+    else await actions.openFolder(entry.path);
+  },
+
+  async importZip(data: string, label?: string) {
+    await flushPending();
+    const view = await run("open", () => api.importProjectZip(data, label));
+    if (!view) return;
+    adopt(view);
+    await loadGraph();
+  },
+
+  async newMemory(label?: string) {
+    await flushPending();
+    const view = await run("open", () => api.newMemoryProject(label));
+    if (!view) return;
+    adopt(view);
+    await loadGraph();
+  },
+
+  /**
+   * Loads the details behind a hovered graph node. Failures stay quiet: the
+   * card simply shows what the graph already knows.
+   */
+  async loadHover(id: string | null) {
+    if (!id) {
+      hoverSeq += 1;
+      state.hover = null;
+      return;
+    }
+    if (state.hover?.id === id) return;
+    const token = (hoverSeq += 1);
+    try {
+      const detail = await api.nodeDetail(id);
+      if (token === hoverSeq) state.hover = detail;
+    } catch {
+      if (token === hoverSeq) state.hover = null;
+    }
+  },
+
+  /** Opens or closes the settings modal. */
+  setSettingsOpen(open: boolean) {
+    state.settingsOpen = open;
+  },
+
+  /**
+   * The one source of truth: both boards and the workspace are re-read from the
+   * VFS together. Every page renders from `state`, so nothing can go stale.
+   */
+  async refresh() {
+    const view = await run("refresh", () => api.workspaceView());
+    if (!view) return;
+    state.view = view;
+    await Promise.all([reloadBoards(), loadSettings()]);
+  },
+
+  async close() {
+    await flushPending();
+    await run("close", () => api.closeProject());
+    state.page = "welcome";
+    state.view = null;
+    state.graph = null;
+    state.logic = null;
+    setSelection([]);
+    state.detail = null;
+    state.editorOpen = false;
+    state.printed = null;
+    state.printedOpen = false;
+    await loadRecents();
+  },
+
+  /** Switches the board between the AST tree view and the logic graph. */
+  async setBoardView(view: BoardView) {
+    if (state.boardView === view) return;
+    state.boardView = view;
+    state.editorOpen = false;
+    if (view === "logic" && state.logic === null) await loadLogic();
+  },
+
+  /** Selects a node in every panel and (optionally) opens the editor. */
+  /** Replaces the selection; a single item updates an open modal. */
+  async select(id: string, options: { focus?: boolean } = {}) {
+    setSelection([id]);
+    state.saveError = null;
+    // A modal that is open follows a single selection; with several selected
+    // items it keeps showing what it was opened with.
+    if (state.editorOpen && DETAILABLE.test(id)) await loadDetail(id);
+    if (options.focus) {
+      const graph = await run("focus", () => api.focusGraphNode(id));
+      if (graph) state.graph = graph;
+    }
+  },
+
+  /** Replaces the selection with several items (rubber band, group click). */
+  async selectMany(ids: string[]) {
+    setSelection(ids);
+    state.saveError = null;
+    if (state.editorOpen && ids.length === 1 && DETAILABLE.test(ids[0])) await loadDetail(ids[0]);
+  },
+
+  /** Ctrl/Cmd-click: adds or removes one item. */
+  async toggleSelected(id: string) {
+    const next = state.selectedIds.includes(id)
+      ? state.selectedIds.filter((current) => current !== id)
+      : [...state.selectedIds, id];
+    await actions.selectMany(next);
+  },
+
+  /** Double click: opens the editor for one item. */
+  async openNode(id: string) {
+    setSelection([id]);
+    state.saveError = null;
+    if (!DETAILABLE.test(id)) return;
+    state.editorOpen = true;
+    await loadDetail(id);
+  },
+
+  /** Moves terms (or namespaces) into a theory, or back to unassigned. */
+  async assignTheory(ids: string[], theory: string | null) {
+    if (ids.length === 0) return;
+    await flushPending();
+    const logic = await run("logic", () =>
+      api.assignTheory(state.openTheory || null, ids, theory),
+    );
+    if (logic) state.logic = overlay(logic);
+  },
+
+  /** Opens a theory graph (`""` for the root) and remembers the framing. */
+  async openTheory(key: string) {
+    if (state.openTheory === key) return;
+    await flushPending();
+    state.openTheory = key;
+    await loadLogic();
+  },
+
+  /** Creates a theory in the open graph (or the root one). */
+  async createTheory(name: string) {
+    await flushPending();
+    const logic = await run("logic", () =>
+      api.createTheory(state.openTheory || null, name),
+    );
+    if (logic) state.logic = overlay(logic);
+  },
+
+  /** Renames a theory node; its key (and so its place) is kept. */
+  async renameTheory(key: string, name: string) {
+    await flushPending();
+    const logic = await run("logic", () =>
+      api.renameTheory(state.openTheory || null, key, name),
+    );
+    if (logic) state.logic = overlay(logic);
+  },
+
+  /** Adds an axiom to a file, or to a new one at `path`, and shows it. */
+  async addAxiom(name: string, file: string | null, path: string | null) {
+    await flushPending();
+    const logic = await run("logic", () =>
+      api.addAxiom(state.openTheory || null, name, file, path),
+    );
+    if (!logic) return false;
+    state.logic = overlay(logic);
+    // The axiom is now a term of the project: refresh the tree and the AST board.
+    await reloadBoards();
+    state.notice = `added axiom ${name}`;
+    return true;
+  },
+
+  /** Deletes a theory; its terms return to the unassigned pile. */
+  async deleteTheory(key: string) {
+    await flushPending();
+    if (state.openTheory === key) state.openTheory = "";
+    const logic = await run("logic", () =>
+      api.deleteTheory(state.openTheory || null, key),
+    );
+    if (logic) {
+      const view = overlay(logic);
+      state.openTheory =
+        view.trail.length > 1 ? (view.trail[view.trail.length - 1]?.key ?? "") : "";
+      state.logic = view;
+    }
+  },
+
+  /** Adds a layer divider to the open theory graph. */
+  async createLayer(name: string, y: number) {
+    if (!state.openTheory) return;
+    await flushPending();
+    const logic = await run("logic", () => api.createLayer(state.openTheory, name, y));
+    if (logic) state.logic = overlay(logic);
+  },
+
+  async deleteLayer(id: string) {
+    if (!state.openTheory) return;
+    await flushPending();
+    const logic = await run("logic", () => api.deleteLayer(state.openTheory, id));
+    if (logic) state.logic = overlay(logic);
+  },
+
+  async moveLayer(id: string, y: number) {
+    if (!state.openTheory) return;
+    // The board may hold drags that have not been written yet; they must not be
+    // lost (or undone) by the graph this returns.
+    await flushPending();
+    const logic = await run("logic", () => api.moveLayer(state.openTheory, id, y));
+    if (logic) state.logic = overlay(logic);
+  },
+
+  /** Renames a layer divider of the open theory graph. */
+  async renameLayer(id: string, name: string) {
+    if (!state.openTheory) return;
+    await flushPending();
+    const logic = await run("logic", () => api.renameLayer(state.openTheory, id, name));
+    if (logic) state.logic = overlay(logic);
+  },
+
+  /** Applies drag results locally and queues a write to `.klean.json`. */
+  savePositions(board: "ast" | "logic", positions: api.FixedNode[]) {
+    applyPositions(board, positions);
+    const key = graphKey(board);
+    pending.positions[key] = mergePositions(pending.positions[key], positions);
+    scheduleFlush();
+  },
+
+  /** Remembers a graph camera; written with the same flush as positions. */
+  saveCamera(board: "ast" | "logic", camera: api.Camera) {
+    if (board === "ast" && state.graph) state.graph = { ...state.graph, camera };
+    if (board === "logic" && state.logic) state.logic = { ...state.logic, camera };
+    pending.camera[graphKey(board)] = camera;
+    scheduleFlush();
+  },
+
+  /** Remembers where a link's middle segment was dragged to. */
+  async saveLinkBend(board: "ast" | "logic", key: string, value: number | null) {
+    const target = board === "ast" ? state.graph : state.logic;
+    if (target) {
+      const links = target.links.map((link) =>
+        `${link.source}->${link.target}` === key ? { ...link, bend: value } : link,
+      );
+      if (board === "ast" && state.graph) state.graph = { ...state.graph, links };
+      if (board === "logic" && state.logic) state.logic = { ...state.logic, links };
+    }
+    const result = await run("bend", () => api.saveLinkBend(graphKey(board), key, value));
+    void result;
+  },
+
+  /** Loads the settings tree. */
+  async loadSettings() {
+    const tree = await run("settings", () => api.settingsView());
+    if (tree) state.settings = tree;
+  },
+
+  /** Applies edited settings and re-reads the boards. */
+  async saveSettings(values: [string, string][]) {
+    const tree = await run("settings", () => api.saveSettings(values));
+    if (!tree) return false;
+    state.settings = tree;
+    await actions.refresh();
+    return true;
+  },
+
+  /** Saves the plain comments above a node. */
+  async applyComments(text: string) {
+    const id = state.detail?.id;
+    if (!id) return;
+    state.saving = true;
+    state.saveError = null;
+    try {
+      const result = await api.updateComments(id, text);
+      state.detail = result.detail;
+      if (state.view) {
+        state.view.tree = result.tree;
+        state.view.stats = result.stats;
+      }
+      await reloadBoards();
+    } catch (error) {
+      state.saveError = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.saving = false;
+    }
+  },
+
+  closeEditor() {
+    state.editorOpen = false;
+    state.saveError = null;
+  },
+
+  async toggleGraph(id: string) {
+    const graph = await run("graph", () => api.toggleGraphNode(id));
+    if (graph) state.graph = graph;
+  },
+
+  async applyText(text: string) {
+    const id = state.detail?.id;
+    if (!id) return;
+    state.saving = true;
+    state.saveError = null;
+    try {
+      const result = await api.updateNode(id, text);
+      state.detail = result.detail;
+      if (state.view) {
+        state.view.tree = result.tree;
+        state.view.stats = result.stats;
+      }
+      await reloadBoards();
+    } catch (error) {
+      state.saveError = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.saving = false;
+    }
+  },
+
+  async rename(name: string) {
+    const id = state.detail?.id;
+    if (!id) return;
+    state.saving = true;
+    state.saveError = null;
+    try {
+      const result = await api.renameNode(id, name);
+      state.detail = result.detail;
+      setSelection([result.id]);
+      if (state.view) {
+        state.view.tree = result.tree;
+        state.view.stats = result.stats;
+      }
+      await reloadBoards();
+    } catch (error) {
+      state.saveError = error instanceof Error ? error.message : String(error);
+    } finally {
+      state.saving = false;
+    }
+  },
+
+  /** Creates a Lean file relative to the project root. */
+  async createFile(path: string) {
+    const view = await run("create", () => api.createFile(path));
+    if (!view) return;
+    state.view = view;
+    await reloadBoards();
+    state.notice = `created ${path}`;
+  },
+
+  async deleteFile(path: string) {
+    const view = await run("delete", () => api.deleteFile(path));
+    if (!view) return;
+    state.view = view;
+    if (state.detail?.path === path) {
+      state.detail = null;
+      state.editorOpen = false;
+      setSelection([]);
+    }
+    await reloadBoards();
+    state.notice = `deleted ${path}`;
+  },
+
+  async showOutline() {
+    const outline = await run("outline", () => api.exportOutline());
+    if (outline !== null) {
+      state.printed = {
+        title: "Lean outline",
+        subtitle: "whole project · printed by Rust",
+        text: outline,
+      };
+      state.printedOpen = true;
+    }
+  },
+
+  /** Removes an axiom (or any declaration) from the file that holds it. */
+  async deleteNode(id: string) {
+    await flushPending();
+    // The command answers with nothing, so success is "no error was reported".
+    await run("delete", () => api.deleteNode(id));
+    if (state.error) return false;
+    // The term is gone from the project: re-read the boards and the tree, so it
+    // leaves the graph immediately instead of on the next refresh.
+    await reloadBoards();
+    const view = await run("view", () => api.workspaceView());
+    if (view) state.view = view;
+    if (state.detail?.id === id) {
+      state.detail = null;
+      state.editorOpen = false;
+    }
+    if (state.selectedIds.includes(id)) {
+      setSelection(state.selectedIds.filter((current) => current !== id));
+    }
+    state.hover = null;
+    state.notice = "declaration removed";
+    return true;
+  },
+
+  /** The whole file the node came from, untouched. */
+  async showFile() {
+    const id = state.detail?.id;
+    if (!id) return;
+    const text = await run("file", () => api.fileSource(id));
+    if (text === null) return;
+    state.printed = {
+      title: state.detail?.path ?? "File",
+      subtitle: "the file as it is on disk",
+      text,
+    };
+    state.printedOpen = true;
+  },
+
+  closePrinted() {
+    state.printedOpen = false;
+  },
+
+  async exportZip(path: string) {
+    const bytes = await run("export", () => api.exportZipTo(path));
+    if (bytes !== null) state.notice = `wrote ${(bytes / 1024).toFixed(1)} KiB zip`;
+  },
+
+  async saveOutline(path: string) {
+    const text = await run("export", () => api.exportOutlineTo(path));
+    if (text !== null) state.notice = `wrote ${text.split("\n").length} lines of Lean`;
+  },
+
+  dismissNotice() {
+    state.notice = null;
+  },
+
+  dismissError() {
+    state.error = null;
+  },
+};
