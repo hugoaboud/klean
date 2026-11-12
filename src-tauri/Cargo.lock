@@ -1939,7 +1939,7 @@ dependencies = [
  "base64 0.22.1",
  "flate2",
  "klean-ai",
- "klean-ast",
+ "lean4-ast",
  "serde",
  "serde_json",
  "tar",
@@ -1964,10 +1964,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "klean-ast"
-version = "0.1.0"
+name = "lean4-ast"
+version = "4.36.0"
 dependencies = [
- "serde",
  "serde_json",
 ]
 

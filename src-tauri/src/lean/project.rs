@@ -12,7 +12,7 @@ use super::ast::{
 };
 use super::dto::{
     CameraDto, DiagnosticDto, GraphLink, GraphNode, LogicGraph, NodeDetail, PreviewResult,
-    ProjectGraph, SettingNode, Stats, TreeNode, UpdateResult, WorkspaceView,
+    ProjectGraph, ProjectSummary, SettingNode, Stats, TreeNode, UpdateResult, WorkspaceView,
 };
 use super::engine::{Engine, LeanStatus, Parse};
 use super::error::{LeanError, LeanResult};
@@ -432,9 +432,6 @@ impl Project {
         if !status.enabled {
             return Some("Lean is switched off: the board shows file names only".to_string());
         }
-        if status.backend != "folder" {
-            return Some("this workspace has no folder on disk to read".to_string());
-        }
         if !status.available {
             return Some(format!(
                 "no Lean toolchain yet ({}): the board shows file names only",
@@ -484,7 +481,7 @@ impl Project {
     }
 
     /// Where the parser would look for modules, for the scan to prepare it with.
-    pub fn parser_options(&self) -> LeanResult<klean_ast::Options> {
+    pub fn parser_options(&self) -> LeanResult<lean4_ast::Options> {
         self.engine.parser_options()
     }
 
@@ -511,21 +508,23 @@ impl Project {
     /// files is known from the filesystem alone, so the board can be on screen in
     /// milliseconds. Reading the files — the declarations, the diagnostics — is
     /// [`crate::lean::scan`]'s job, in the background.
-    pub fn view_listing(&mut self) -> LeanResult<WorkspaceView> {
-        self.assemble(&HashMap::new(), true)
+    /// What the project is, without reading any of it: the parse modal's heading.
+    pub fn summary(&self) -> ProjectSummary {
+        ProjectSummary {
+            label: self.fs.label().to_string(),
+            backend: self.fs.backend().label().to_string(),
+            root: self.fs.origin().map(|path| path.display().to_string()),
+            files: self.scan_files().len(),
+        }
     }
 
     /// Full project view: the AST item tree plus aggregate statistics.
     pub fn view(&mut self) -> LeanResult<WorkspaceView> {
         let loaded = self.load_all()?;
-        self.assemble(&loaded, false)
+        self.assemble(&loaded)
     }
 
-    fn assemble(
-        &mut self,
-        loaded: &HashMap<String, Arc<CachedFile>>,
-        pending: bool,
-    ) -> LeanResult<WorkspaceView> {
+    fn assemble(&mut self, loaded: &HashMap<String, Arc<CachedFile>>) -> LeanResult<WorkspaceView> {
         let libs = self.libs.clone();
         let mut stats = Stats {
             libs: libs.len(),
@@ -547,7 +546,6 @@ impl Project {
                 .map(|path| path.display().to_string()),
             tree,
             stats,
-            pending,
         })
     }
 
@@ -646,8 +644,11 @@ impl Project {
                 children.push(self.ast_node(&file.rel, &[index], node, cached));
             }
         }
-        let detail = match cached {
-            Some(cached) => {
+        // Every file is parsed before the board is shown, so a file with no
+        // declaration is one that could not be read: it shows nothing rather than
+        // claiming to be unread.
+        let detail = cached
+            .map(|cached| {
                 // Informational messages (`#check` output) are not issues.
                 let issues = cached
                     .parsed
@@ -660,10 +661,8 @@ impl Project {
                 } else {
                     format!("{issues} issue{}", plural(issues))
                 }
-            }
-            // Not in the cache: the background scan has not reached this file yet.
-            None => "not parsed yet".to_string(),
-        };
+            })
+            .unwrap_or_default();
         let status = cached.and_then(|_| worst_status(&children));
         (
             TreeNode {
@@ -3023,28 +3022,21 @@ mod editor_tests {
     }
 
     /// Opening a project is a filesystem walk, nothing more: the declarations are
-    /// what the background scan adds afterwards.
+    /// what the scan adds afterwards, and the board is not built before it has.
     #[test]
     fn opening_a_project_reads_nothing_until_the_scan_runs() {
         let root = scratch("listing");
         let mut project = Project::open(&root, std::env::temp_dir().join("klean-test-appdata"))
             .expect("project");
 
-        let listing = project.view_listing().expect("listing");
-        assert!(listing.pending, "the view says its files are unread");
-        let file = listing
-            .tree
-            .first()
-            .and_then(|lib| super::tests::find_file(lib, "Demo/Basic.lean"))
-            .expect("the module is listed");
+        let summary = project.summary();
+        assert!(summary.files >= 1, "the files are listed: {}", summary.files);
         assert!(
-            file.children.is_empty(),
-            "the listing carries no declarations: {:?}",
-            file.children.iter().map(|node| &node.label).collect::<Vec<_>>()
+            !project.is_read(),
+            "opening reads no file: that is what the scan is for"
         );
-        assert_eq!(file.detail.as_deref(), Some("not parsed yet"));
 
-        // What the background scan does, one file at a time.
+        // What the scan does, one file at a time.
         let files = project.scan_files();
         assert!(files.contains(&"Demo/Basic.lean".to_string()), "{files:?}");
         for rel in &files {
@@ -3056,7 +3048,6 @@ mod editor_tests {
         }
 
         let full = project.view().expect("view");
-        assert!(!full.pending, "the files have been read");
         let file = full
             .tree
             .first()

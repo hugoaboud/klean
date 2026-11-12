@@ -13,7 +13,7 @@ use crate::lean::lsp::Goals;
 use crate::lean::scan::{Scan, ScanState};
 use crate::lean::{
     FixedNode, LeanStatus, LogicGraph, NodeDetail, PreviewResult, Project, ProjectGraph,
-    RecentProject, Recents, SettingNode, UpdateResult, WorkspaceView,
+    ProjectSummary, RecentProject, Recents, SettingNode, UpdateResult, WorkspaceView,
 };
 
 /// Holds the currently open project and the recently opened list. One workspace
@@ -147,10 +147,6 @@ impl AppState {
     }
 }
 
-fn view_of(project: &mut Project) -> Result<WorkspaceView, String> {
-    project.view().map_err(message)
-}
-
 // ------------------------------------------------------------------ workspace
 
 #[tauri::command(async)]
@@ -158,17 +154,17 @@ pub fn open_project(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     path: String,
-) -> Result<WorkspaceView, String> {
+) -> Result<ProjectSummary, String> {
     let mut project = Project::open(&path, state.data_dir()?).map_err(message)?;
     attach_build_console(&app, &mut project);
-    // Nothing is parsed here: the board opens from the file listing, and the
-    // files are read afterwards by the scan job.
-    let view = project.view_listing().map_err(message)?;
+    // Nothing is parsed here: opening is a filesystem walk. The files are read by
+    // the scan job, and the board is only built once they are all in.
+    let summary = project.summary();
     state.next_generation();
     configure_ai(&state, &project);
     *state.project.lock().map_err(message)? = Some(project);
     state.remember_path(&path, "folder");
-    Ok(view)
+    Ok(summary)
 }
 
 #[tauri::command(async)]
@@ -176,7 +172,7 @@ pub fn open_project_zip(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     path: String,
-) -> Result<WorkspaceView, String> {
+) -> Result<ProjectSummary, String> {
     let bytes = std::fs::read(&path).map_err(message)?;
     let label = std::path::Path::new(&path)
         .file_stem()
@@ -185,11 +181,11 @@ pub fn open_project_zip(
     let mut project = Project::from_zip(&bytes, label, state.data_dir()?).map_err(message)?;
     attach_build_console(&app, &mut project);
     state.next_generation();
-    let view = view_of(&mut project)?;
+    let summary = project.summary();
     configure_ai(&state, &project);
     *state.project.lock().map_err(message)? = Some(project);
     state.remember_path(&path, "zip");
-    Ok(view)
+    Ok(summary)
 }
 
 /// Imports an archive that the front-end already holds (base64 encoded).
@@ -199,7 +195,7 @@ pub fn import_project_zip(
     state: State<'_, AppState>,
     data: String,
     label: Option<String>,
-) -> Result<WorkspaceView, String> {
+) -> Result<ProjectSummary, String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
         .map_err(message)?;
@@ -211,10 +207,10 @@ pub fn import_project_zip(
     .map_err(message)?;
     attach_build_console(&app, &mut project);
     state.next_generation();
-    let view = view_of(&mut project)?;
+    let summary = project.summary();
     configure_ai(&state, &project);
     *state.project.lock().map_err(message)? = Some(project);
-    Ok(view)
+    Ok(summary)
 }
 
 /// Starts an empty in-memory workspace, i.e. the browser-style backend.
@@ -222,16 +218,24 @@ pub fn import_project_zip(
 pub fn new_memory_project(
     state: State<'_, AppState>,
     label: Option<String>,
-) -> Result<WorkspaceView, String> {
-    let mut project = Project::memory(
+) -> Result<ProjectSummary, String> {
+    let project = Project::memory(
         label.unwrap_or_else(|| "workspace".to_string()),
         state.data_dir()?,
     )
     .map_err(message)?;
     state.next_generation();
-    let view = view_of(&mut project)?;
+    let summary = project.summary();
     *state.project.lock().map_err(message)? = Some(project);
-    Ok(view)
+    Ok(summary)
+}
+
+/// The open project, if there is one — without reading it. Used at start-up for a
+/// project given on the command line.
+#[tauri::command]
+pub fn project_summary(state: State<'_, AppState>) -> Result<Option<ProjectSummary>, String> {
+    let guard = state.project.lock().map_err(message)?;
+    Ok(guard.as_ref().map(Project::summary))
 }
 
 #[tauri::command(async)]
@@ -245,13 +249,10 @@ pub fn close_project(state: State<'_, AppState>) -> Result<(), String> {
 /// not reached yet show as files.
 #[tauri::command(async)]
 pub fn workspace_view(state: State<'_, AppState>) -> Result<WorkspaceView, String> {
-    with_project(&state, |project| {
-        if project.is_read() {
-            project.view().map_err(message)
-        } else {
-            project.view_listing().map_err(message)
-        }
-    })
+    // The board is only ever asked for once the files have been read: the modal
+    // holds the project page back until then, and a cancellation closes the project
+    // instead of showing it half-read.
+    with_project(&state, |project| project.view().map_err(message))
 }
 
 // ---------------------------------------------------------------------- scan
@@ -270,7 +271,8 @@ pub fn scan_project(state: State<'_, AppState>) -> Result<ScanState, String> {
         if let Some(reason) = project.scan_blocked() {
             return Ok(ScanState {
                 running: false,
-                summary: Some(reason),
+                summary: Some(reason.clone()),
+                blocked: Some(reason),
                 ..Default::default()
             });
         }

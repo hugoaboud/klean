@@ -3,14 +3,15 @@
 //! An [`Engine`] owns the toolchain, the parser library and the language server
 //! session for one project.
 //!
-//! Parsing is a plain library call (`klean_ast::parse`): Lean's parser runs inside
+//! Parsing is a plain library call (`lean4_ast::parse`): Lean's parser runs inside
 //! the KLEAN process, in microseconds, so no project file ever spawns a process.
 //! The language server is the only subprocess, it stays up for the whole project,
 //! and everything about it is asynchronous — a slow file never blocks the UI.
 //!
-//! Only folder projects get an engine that can do anything: a zip archive or an
-//! in-memory workspace has no place for `lake` to run, and the board says so
-//! instead of pretending.
+//! Parsing needs no folder: a zip archive or an in-memory workspace is parsed the
+//! same way, from the toolchain's own modules. What does need a folder is the
+//! language server and `lake build` — neither has anywhere to run without one, and
+//! they say so instead of pretending.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,7 +26,7 @@ use super::build::{self, Build, BuildState};
 use super::error::{LeanError, LeanResult};
 use super::lsp::{Client, Goals};
 use super::toolchain::{self, LeanSettings, Toolchain};
-use klean_ast::{FileAst, Options, ParseRequest};
+use lean4_ast::{Options, ParseRequest};
 
 /// How much context a parse gets: a whole-project read, or the file being edited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,8 +74,8 @@ fn resolve(settings: &LeanSettings, app_data: &Path) -> Result<Toolchain, String
     toolchain::resolve_for_parser(
         settings,
         app_data,
-        klean_ast::LEAN_VERSION,
-        Path::new(klean_ast::BUILD_TOOLCHAIN),
+        lean4_ast::LEAN_VERSION,
+        Path::new(lean4_ast::BUILD_TOOLCHAIN),
     )
     .map_err(|error| error.to_string())
 }
@@ -108,13 +109,10 @@ impl Engine {
         backend: &str,
     ) -> Engine {
         let settings = LeanSettings::read(values);
-        let toolchain = match &root {
-            Some(_) => resolve(&settings, &app_data),
-            None => Err(
-                "Lean checks need a folder project: archives and in-memory workspaces are not built"
-                    .to_string(),
-            ),
-        };
+        // The parser only needs a toolchain, not a folder: an archive is parsed in
+        // memory like anything else. The language server is the part that needs a
+        // project root on disk, and it says so when it is asked.
+        let toolchain = resolve(&settings, &app_data);
         Engine {
             app_data,
             settings,
@@ -175,13 +173,7 @@ impl Engine {
     pub fn reconfigure(&mut self, values: &BTreeMap<String, String>) {
         self.stop();
         self.settings = LeanSettings::read(values);
-        self.toolchain = match &self.root {
-            Some(_) => resolve(&self.settings, &self.app_data),
-            None => Err(
-                "Lean checks need a folder project: archives and in-memory workspaces are not built"
-                    .to_string(),
-            ),
-        };
+        self.toolchain = resolve(&self.settings, &self.app_data);
     }
 
     pub fn stop(&mut self) {
@@ -253,10 +245,7 @@ impl Engine {
     /// Cheap enough to ask for on its own: building the environment for these is
     /// the expensive part, and that happens on the first parse.
     pub fn parser_options(&self) -> LeanResult<Options> {
-        let root = self
-            .root
-            .clone()
-            .ok_or_else(|| LeanError::msg("Lean parsing needs a folder project"))?;
+        let root = self.root.clone();
         let toolchain = self.toolchain()?.clone();
         let lib = toolchain.library_directory().ok_or_else(|| {
             LeanError::msg(format!(
@@ -266,13 +255,16 @@ impl Engine {
         })?;
         let mut options = Options::new(&lib);
         // `lake build` output first: a project's own modules win over nothing,
-        // and Lean reads them like any other module directory.
-        for candidate in [
-            root.join(".lake/build/lib/lean"),
-            root.join(".lake/build/lib"),
-        ] {
-            if candidate.is_dir() {
-                options.search_path.push(candidate);
+        // and Lean reads them like any other module directory. An archive has no
+        // build output to add — the toolchain's own modules are all it needs.
+        if let Some(root) = root {
+            for candidate in [
+                root.join(".lake/build/lib/lean"),
+                root.join(".lake/build/lib"),
+            ] {
+                if candidate.is_dir() {
+                    options.search_path.push(candidate);
+                }
             }
         }
         Ok(options)
@@ -319,7 +311,7 @@ impl Engine {
             return Ok(());
         }
         let options = self.parser_options()?;
-        match klean_ast::init(&options) {
+        match lean4_ast::init(&options) {
             Ok(info) => {
                 self.parser_ready = true;
                 let _ = info;
@@ -345,28 +337,36 @@ impl Engine {
             return Err(LeanError::msg("Lean integration is switched off"));
         }
         self.start_parser()?;
+        // The tree stays in Lean's heap and the mapper reads it there: nothing is
+        // copied out of it, so a file costs what Lean spent parsing it.
         let core_only = self.parse_with(source, path, &[])?;
+        let core = Self::commands_of(&core_only);
         if mode == Parse::Tree {
-            return Ok(ast::build(source, &core_only));
+            return Ok(ast::build(source, &core));
         }
         // Loading a file's imports means building an environment for them, which
         // for a large library is hundreds of megabytes. That is only worth it when
         // the project has actually been built: without build output there is
         // nothing to load, and the core tree is the honest answer.
         if !self.project_is_built() {
-            return Ok(ast::build(source, &core_only));
+            return Ok(ast::build(source, &core));
         }
-        let imports = ast::imports_of(&core_only);
+        let imports = ast::imports_of(&core);
         let names: Vec<&str> = imports.iter().map(String::as_str).collect();
         if names.is_empty() {
-            return Ok(ast::build(source, &core_only));
+            return Ok(ast::build(source, &core));
         }
         match self.parse_with(source, path, &names) {
-            Ok(file) => Ok(ast::build(source, &file)),
+            Ok(exact) => Ok(ast::build(source, &Self::commands_of(&exact))),
             // An unbuilt module only costs the extensions it would have brought:
             // the core-only tree is still usable, and the server reports the rest.
-            Err(_) => Ok(ast::build(source, &core_only)),
+            Err(_) => Ok(ast::build(source, &core)),
         }
+    }
+
+    /// The file's top-level commands, borrowed from the tree Lean built.
+    fn commands_of(tree: &lean4_ast::ParseTree) -> Vec<lean4_ast::Syntax<'_>> {
+        tree.nodes().iter().collect()
     }
 
     /// True when `lake build` has produced something to import.
@@ -381,8 +381,8 @@ impl Engine {
         source: &str,
         path: &str,
         imports: &[&str],
-    ) -> LeanResult<FileAst> {
-        klean_ast::parse(ParseRequest {
+    ) -> LeanResult<lean4_ast::ParseTree> {
+        lean4_ast::parse(ParseRequest {
             path,
             source,
             imports,
@@ -467,3 +467,5 @@ impl Engine {
     }
 
 }
+
+

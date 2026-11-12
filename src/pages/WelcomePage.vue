@@ -119,6 +119,8 @@ async function newMemory() {
       </div>
 
       <p v-if="state.error" class="welcome__error">{{ state.error }}</p>
+      <!-- e.g. a project whose read was stopped before it could open. -->
+      <p v-else-if="state.notice" class="welcome__notice">{{ state.notice }}</p>
     </UiCard>
 
     <footer class="welcome__foot">
@@ -275,6 +277,16 @@ async function newMemory() {
   font-family: var(--mono);
   font-size: 10px;
   color: var(--text-faint);
+}
+
+.welcome__notice {
+  margin: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--bg-1);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
 }
 
 .welcome__error {

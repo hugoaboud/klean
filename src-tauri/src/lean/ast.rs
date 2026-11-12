@@ -1,10 +1,12 @@
 //! The syntax model the board renders, built from Lean's own syntax tree.
 //!
-//! KLEAN does not parse Lean: [`crate::lean::engine`] asks the `klean-ast`
+//! KLEAN does not parse Lean: [`crate::lean::engine`] asks the `lean4-ast`
 //! library, which runs Lean's parser, and this module is the only place that
-//! knows what the resulting syntax *means* for the board. It picks the commands
-//! out of the tree, maps Lean's syntax kinds to the short labels the UI uses,
-//! nests `namespace`/`section`/`mutual` blocks, finds structure fields,
+//! knows what the resulting syntax *means* for the board. It reads that tree
+//! through [`Syntax`] — a borrowed view of the objects Lean allocated, not a copy
+//! of them — so mapping a file costs only the walk this module does. It picks the
+//! commands out of the tree, maps Lean's syntax kinds to the short labels the UI
+//! uses, nests `namespace`/`section`/`mutual` blocks, finds structure fields,
 //! inductive constructors and `where` declarations, and reads the comments that
 //! sit above a command (Lean's tree does not carry them).
 //!
@@ -12,7 +14,90 @@
 //! an edit replaces exactly the node's span and leaves everything around it
 //! untouched.
 
-use klean_ast::{FileAst, Node as SyntaxNode};
+use std::borrow::Cow;
+
+/// What the mapper reads from a node of Lean's syntax tree.
+///
+/// Production is [`lean4_ast::Syntax`], a *borrowed* view of the tree Lean built:
+/// reading a file costs the parser's work and nothing else, because nothing is
+/// copied out of Lean's heap. The tests implement this trait for hand-built nodes,
+/// so the mapper is tested without a toolchain.
+pub trait Syntax: Clone {
+    /// Lean's kind with the dotted prefix stripped (`definition`).
+    fn short_kind(&self) -> Cow<'_, str>;
+    /// Byte range in the source; `None` for synthetic (whitespace) nodes.
+    fn span(&self) -> Option<lean4_ast::Span>;
+    /// Token text, for atoms and identifiers.
+    fn text(&self) -> Option<Cow<'_, str>>;
+    /// How many children this node has.
+    fn child_count(&self) -> usize;
+    /// One child, by position.
+    fn child(&self, index: usize) -> Option<Self>;
+
+    /// First descendant (inclusive) with this short kind.
+    fn find(&self, short_kind: &str) -> Option<Self> {
+        if self.short_kind() == short_kind {
+            return Some(self.clone());
+        }
+        (0..self.child_count()).find_map(|index| self.child(index)?.find(short_kind))
+    }
+
+    /// Every descendant (inclusive) with this short kind.
+    fn find_all(&self, short_kind: &str, out: &mut Vec<Self>) {
+        if self.short_kind() == short_kind {
+            out.push(self.clone());
+        }
+        for index in 0..self.child_count() {
+            if let Some(child) = self.child(index) {
+                child.find_all(short_kind, out);
+            }
+        }
+    }
+
+    /// First identifier at or below this node.
+    fn first_ident(&self) -> Option<Self> {
+        if self.short_kind() == "ident" {
+            return Some(self.clone());
+        }
+        (0..self.child_count()).find_map(|index| self.child(index)?.first_ident())
+    }
+}
+
+impl<'a> Syntax for lean4_ast::Syntax<'a> {
+    fn short_kind(&self) -> Cow<'_, str> {
+        lean4_ast::Syntax::short_kind(self)
+    }
+
+    fn span(&self) -> Option<lean4_ast::Span> {
+        lean4_ast::Syntax::span(self)
+    }
+
+    fn text(&self) -> Option<Cow<'_, str>> {
+        lean4_ast::Syntax::text(self)
+    }
+
+    fn child_count(&self) -> usize {
+        self.children().len()
+    }
+
+    fn child(&self, index: usize) -> Option<Self> {
+        self.children().get(index)
+    }
+
+    // The library walks the heap itself; these keep that walk instead of rebuilding
+    // it out of `child`.
+    fn find(&self, short_kind: &str) -> Option<Self> {
+        lean4_ast::Syntax::find(self, short_kind)
+    }
+
+    fn find_all(&self, short_kind: &str, out: &mut Vec<Self>) {
+        lean4_ast::Syntax::find_all(self, short_kind, out);
+    }
+
+    fn first_ident(&self) -> Option<Self> {
+        lean4_ast::Syntax::first_ident(self).map(lean4_ast::Syntax::Ident)
+    }
+}
 
 /// Byte range inside a source file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -23,7 +108,7 @@ pub struct Span {
 
 impl Span {
     /// Converts a span reported by the parser library.
-    pub fn from_lean(span: klean_ast::Span) -> Span {
+    pub fn from_lean(span: lean4_ast::Span) -> Span {
         Span::new(span.start, span.end)
     }
 
@@ -328,28 +413,32 @@ fn hidden(short: &str) -> bool {
 /// Peels the wrappers Lean puts around a command until the command itself shows:
 /// a `declaration` holds the modifiers (doc comment, attributes) and then the
 /// `definition`/`theorem`/… it declares.
-fn command_of<'a>(node: &'a SyntaxNode) -> Option<&'a SyntaxNode> {
-    if node.short_kind() == "declaration" {
-        return node
-            .children
-            .iter()
-            .find(|child| !hidden(child.short_kind()) && child.short_kind() != "declaration");
+fn command_of<T: Syntax>(node: &T) -> Option<T> {
+    let short = node.short_kind();
+    if short == "declaration" {
+        return (0..node.child_count())
+            .filter_map(|index| node.child(index))
+            .find(|child| !hidden(&child.short_kind()) && child.short_kind() != "declaration");
     }
-    if node.short_kind() == "in" {
+    if short == "in" {
         // `open Foo in <command>` / `set_option … in <command>`.
-        return node
-            .children
-            .iter()
+        return (0..node.child_count())
+            .filter_map(|index| node.child(index))
             .find(|child| child.short_kind() == "declaration")
-            .and_then(command_of)
-            .or_else(|| node.children.iter().rev().find(|child| !hidden(child.short_kind())));
+            .and_then(|child| command_of(&child))
+            .or_else(|| {
+                (0..node.child_count())
+                    .rev()
+                    .filter_map(|index| node.child(index))
+                    .find(|child| !hidden(&child.short_kind()))
+            });
     }
-    Some(node)
+    Some(node.clone())
 }
 
 /// The declared name of a command: its `declId`, else the identifier it starts
 /// with (`namespace Foo`, `#check Nat`, …).
-fn name_of(command: &SyntaxNode) -> Option<(String, Option<Span>)> {
+fn name_of<T: Syntax>(command: &T) -> Option<(String, Option<Span>)> {
     if let Some(decl) = command.find("declId") {
         let span = decl.span().map(Span::from_lean);
         // `def Foo.bar` has one identifier per component; the joined text is the
@@ -358,7 +447,8 @@ fn name_of(command: &SyntaxNode) -> Option<(String, Option<Span>)> {
         decl.find_all("ident", &mut idents);
         let name = idents
             .iter()
-            .filter_map(|ident| ident.text.clone())
+            .filter_map(|ident| ident.text())
+            .map(|text| text.into_owned())
             .collect::<Vec<_>>()
             .join(".");
         if !name.is_empty() {
@@ -366,11 +456,14 @@ fn name_of(command: &SyntaxNode) -> Option<(String, Option<Span>)> {
         }
     }
     let ident = command.first_ident()?;
-    Some((ident.text.clone()?, ident.span().map(Span::from_lean)))
+    Some((
+        ident.text()?.into_owned(),
+        ident.span().map(Span::from_lean),
+    ))
 }
 
 /// The `: type` / binder part of a declaration, as one line.
-fn signature_of(command: &SyntaxNode) -> Option<Span> {
+fn signature_of<T: Syntax>(command: &T) -> Option<Span> {
     command
         .find("optDeclSig")
         .or_else(|| command.find("declSig"))
@@ -380,7 +473,7 @@ fn signature_of(command: &SyntaxNode) -> Option<Span> {
 
 /// Structure fields, inductive constructors and `where` declarations: the rows
 /// that sit inside a declaration rather than beside it.
-fn children_of<'a>(command: &'a SyntaxNode, label: &str) -> Vec<&'a SyntaxNode> {
+fn children_of<T: Syntax>(command: &T, label: &str) -> Vec<T> {
     match label {
         "structure" | "class" => command
             .find("structFields")
@@ -409,7 +502,7 @@ fn children_of<'a>(command: &'a SyntaxNode, label: &str) -> Vec<&'a SyntaxNode> 
 }
 
 /// The doc comment text (`/-- … -/`) sitting in a command's modifiers.
-fn doc_of(source: &str, declaration: &SyntaxNode) -> Option<String> {
+fn doc_of<T: Syntax>(source: &str, declaration: &T) -> Option<String> {
     let doc = declaration.find("docComment")?;
     let span = doc.span()?;
     let text = bare_comment(span.slice(source));
@@ -421,17 +514,17 @@ fn doc_of(source: &str, declaration: &SyntaxNode) -> Option<String> {
 }
 
 /// Builds the board's tree from Lean's syntax tree.
-pub fn build(source: &str, file: &FileAst) -> ParsedFile {
+pub fn build<T: Syntax>(source: &str, commands: &[T]) -> ParsedFile {
     let mut nodes: Vec<AstNode> = Vec::new();
     // Open `namespace`/`section`/`mutual` blocks, innermost last.
     let mut stack: Vec<AstNode> = Vec::new();
 
-    for syntax in file.commands() {
+    for syntax in commands {
         let Some(command) = command_of(syntax) else {
             continue;
         };
         let short = command.short_kind();
-        if hidden(short) {
+        if hidden(&short) {
             continue;
         }
         // `end` closes the innermost block and becomes part of it.
@@ -445,7 +538,7 @@ pub fn build(source: &str, file: &FileAst) -> ParsedFile {
             }
             continue;
         }
-        let Some(label) = label_of(short) else {
+        let Some(label) = label_of(&short) else {
             continue;
         };
         let span = syntax.span().or_else(|| command.span()).map(Span::from_lean);
@@ -464,16 +557,16 @@ pub fn build(source: &str, file: &FileAst) -> ParsedFile {
             comments: None,
             comment_span: None,
             signature: None,
-            idents: idents_of(command),
+            idents: idents_of(&command),
             children: Vec::new(),
         };
         if is_declaration(label) || matches!(label, "namespace" | "section" | "mutual") {
-            if let Some((name, name_span)) = name_of(command) {
+            if let Some((name, name_span)) = name_of(&command) {
                 node.name = Some(name);
                         node.name_span = name_span;
             }
         }
-        if let Some(sig_span) = signature_of(command) {
+        if let Some(sig_span) = signature_of(&command) {
             let text = compact(sig_span.slice(source).to_string());
             if !text.is_empty() {
                 node.sig_span = Some(sig_span);
@@ -481,7 +574,7 @@ pub fn build(source: &str, file: &FileAst) -> ParsedFile {
             }
         }
         let label_owned = node.kind.clone();
-        for child in children_of(command, &label_owned) {
+        for child in children_of(&command, &label_owned) {
             let Some(child_span) = child.span().map(Span::from_lean) else {
                 continue;
             };
@@ -496,7 +589,7 @@ pub fn build(source: &str, file: &FileAst) -> ParsedFile {
                     .find("declId")
                     .and_then(|decl| decl.first_ident())
                     .or_else(|| child.first_ident())
-                    .and_then(|ident| ident.text.clone()),
+                    .and_then(|ident| ident.text().map(|text| text.into_owned())),
                 span: child_span,
                 inner: child_span,
                 name_span: child.find("declId").and_then(|decl| decl.span()).map(Span::from_lean),
@@ -508,7 +601,7 @@ pub fn build(source: &str, file: &FileAst) -> ParsedFile {
                 idents: Vec::new(),
                 children: Vec::new(),
             };
-            if let Some(sig_span) = signature_of(child) {
+            if let Some(sig_span) = signature_of(&child) {
                 let text = compact(sig_span.slice(source).to_string());
                 if !text.is_empty() {
                     row.sig_span = Some(sig_span);
@@ -539,9 +632,9 @@ pub fn build(source: &str, file: &FileAst) -> ParsedFile {
 
 /// Every module a file imports, in file order: what the parser needs to know so
 /// that syntax extensions from those modules are available.
-pub fn imports_of(file: &FileAst) -> Vec<String> {
+pub fn imports_of<T: Syntax>(commands: &[T]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for node in file.commands() {
+    for node in commands {
         let mut imports = Vec::new();
         node.find_all("import", &mut imports);
         for import in imports {
@@ -549,7 +642,8 @@ pub fn imports_of(file: &FileAst) -> Vec<String> {
             import.find_all("ident", &mut idents);
             let name: String = idents
                 .iter()
-                .filter_map(|ident| ident.text.clone())
+                .filter_map(|ident| ident.text())
+                .map(|text| text.into_owned())
                 .collect::<Vec<_>>()
                 .join(".");
             if !name.is_empty() && !out.contains(&name) {
@@ -571,14 +665,14 @@ pub fn imports_of(file: &FileAst) -> Vec<String> {
 }
 
 /// Distinct identifiers used inside a command, for the logic board's uses.
-fn idents_of(command: &SyntaxNode) -> Vec<String> {
+fn idents_of<T: Syntax>(command: &T) -> Vec<String> {
     let mut idents = Vec::new();
     command.find_all("ident", &mut idents);
     let mut out: Vec<String> = Vec::new();
     for ident in idents {
-        if let Some(text) = &ident.text {
-            if !out.iter().any(|existing| existing == text) {
-                out.push(text.clone());
+        if let Some(text) = ident.text() {
+            if !out.iter().any(|existing| existing == text.as_ref()) {
+                out.push(text.into_owned());
             }
         }
     }
@@ -752,13 +846,48 @@ mod tests {
     use super::*;
 
     /// One node of Lean's syntax tree, built by hand: the mapper is what is under
-    /// test here, not the parser (the `klean-ast` crate tests cover that).
+    /// test here, not the parser (the `lean4-ast` crate's own tests cover that).
+    ///
+    /// It implements the same trait the borrowed view does, so the mapper is
+    /// exercised exactly as it runs in production.
+    #[derive(Clone)]
+    struct SyntaxNode {
+        kind: String,
+        span: Option<[u32; 2]>,
+        text: Option<String>,
+        children: Vec<SyntaxNode>,
+    }
+
+    impl Syntax for SyntaxNode {
+        fn short_kind(&self) -> Cow<'_, str> {
+            Cow::Borrowed(&self.kind)
+        }
+
+        fn span(&self) -> Option<lean4_ast::Span> {
+            self.span
+                .map(|[start, end]| lean4_ast::Span { start, end })
+        }
+
+        fn text(&self) -> Option<Cow<'_, str>> {
+            self.text.as_deref().map(Cow::Borrowed)
+        }
+
+        fn child_count(&self) -> usize {
+            self.children.len()
+        }
+
+        fn child(&self, index: usize) -> Option<Self> {
+            self.children.get(index).cloned()
+        }
+    }
+
     fn node(kind: &str, span: Option<[u32; 2]>, children: Vec<SyntaxNode>) -> SyntaxNode {
         SyntaxNode {
-            kind: kind.to_string(),
+            // Fixtures may spell a kind the way Lean does; the parser library hands
+            // its kinds over with the dotted prefix already stripped.
+            kind: kind.rsplit('.').next().unwrap_or(kind).to_string(),
             span,
             text: None,
-            missing: false,
             children,
         }
     }
@@ -768,16 +897,13 @@ mod tests {
             kind: "ident".to_string(),
             span: Some(span),
             text: Some(name.to_string()),
-            missing: false,
             children: Vec::new(),
         }
     }
 
-    fn file(nodes: Vec<SyntaxNode>) -> FileAst {
-        FileAst {
-            nodes,
-            syntax_errors: 0,
-        }
+    /// The commands a file holds: what `build` takes.
+    fn file(nodes: Vec<SyntaxNode>) -> Vec<SyntaxNode> {
+        nodes
     }
 
     /// `def foo : Nat := 1`, wrapped the way Lean wraps declarations.

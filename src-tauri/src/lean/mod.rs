@@ -7,8 +7,9 @@
 //! KLEAN does not parse Lean. The syntax tree, the diagnostics and the proof
 //! goals all come from the official toolchain the user picked:
 //!
-//! - the `klean-ast` crate (see `lean4-ast/`) parses a file into Lean's own
-//!   `Syntax` tree, in this process;
+//! - the `lean4-ast` crate (a sibling checkout, see `../lean4-ast/`) parses a file
+//!   into Lean's own `Syntax` tree, in this process, reading the tree where Lean
+//!   left it instead of serialising it;
 //! - [`ast`] turns that tree into the rows the board shows;
 //! - [`lsp`] talks to `lake serve` / `lean --server` for diagnostics and
 //!   `$/lean/plainGoal`;
@@ -43,7 +44,8 @@ pub use toolchain::Toolchain;
 
 pub use dto::{
     FixedNode, GraphExternal, GraphLayer, GraphLink, GraphNode, LogicGraph, NodeDetail,
-    PreviewResult, ProjectGraph, RecentProject, TheoryRef, UpdateResult, WorkspaceView,
+    PreviewResult, ProjectGraph, ProjectSummary, RecentProject, TheoryRef, UpdateResult,
+    WorkspaceView,
 };
 pub use error::{LeanError, LeanResult};
 pub use project::Project;

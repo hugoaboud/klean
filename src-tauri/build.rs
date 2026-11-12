@@ -18,7 +18,7 @@ fn link_lean_parser() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let link_file = std::env::var_os("KLEAN_AST_LINK")
         .map(PathBuf::from)
-        .unwrap_or_else(|| manifest.join("../lean4-ast/build/link.json"));
+        .unwrap_or_else(|| manifest.join("../../lean4-ast/build/link.json"));
     println!("cargo:rerun-if-env-changed=KLEAN_AST_LINK");
     println!("cargo:rerun-if-changed={}", link_file.display());
 

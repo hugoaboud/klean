@@ -53,6 +53,10 @@ pub struct ScanState {
     pub summary: Option<String>,
     /// True when reading stopped on an error.
     pub failed: bool,
+    /// Set when the read cannot run at all (Lean switched off, no toolchain, no
+    /// folder): the modal says why and offers to open the project anyway.
+    #[serde(default)]
+    pub blocked: Option<String>,
     /// Seconds since the scan started.
     pub seconds: u64,
 }
@@ -226,12 +230,12 @@ fn run(
 /// Lean imports its own `Init` and `Lean` modules here; the result is cached for
 /// the whole process, so every later parse — this scan's, the editor's, the AI
 /// context's — reuses it.
-fn warm(options: &klean_ast::Options) -> Result<(), String> {
+fn warm(options: &lean4_ast::Options) -> Result<(), String> {
     WARMING.store(true, Ordering::SeqCst);
-    let outcome = klean_ast::init(options)
+    let outcome = lean4_ast::init(options)
         .map_err(|error| error.to_string())
         .and_then(|_| {
-            klean_ast::parse(klean_ast::ParseRequest {
+            lean4_ast::parse(lean4_ast::ParseRequest {
                 path: "<klean-warm-up>",
                 source: "def klean_warm_up : Nat := 0\n",
                 imports: &[],

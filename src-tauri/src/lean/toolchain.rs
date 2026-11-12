@@ -1,7 +1,7 @@
 //! Which Lean KLEAN talks to, and how to get one.
 //!
 //! Everything runs the *official* Lean: the parser is a static library built from
-//! Lean's own sources (see `lean4-ast/`), and diagnostics and goals come from
+//! Lean's own sources (see `../lean4-ast/`), and diagnostics and goals come from
 //! Lean's language server. Both are pinned to one Lean version, so this module
 //! finds a toolchain of exactly that version:
 //!
@@ -150,7 +150,7 @@ pub fn resolve_for_parser(
         "this build of KLEAN parses with Lean {version}, but {} is Lean {}.
 \
          Install Lean {version} (`elan toolchain install leanprover/lean4:v{version}`) \
-         or rebuild the parser: `python3 lean4-ast/build.py`.",
+         or rebuild the parser: `python3 ../lean4-ast/build.py`.",
         toolchain.lean.display(),
         toolchain.version
     )))

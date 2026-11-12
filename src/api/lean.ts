@@ -57,11 +57,18 @@ export interface WorkspaceView {
   root: string | null;
   tree: TreeNode[];
   stats: Stats;
-  /**
-   * True when the files have not been read yet: the tree is the file listing, and
-   * the background scan fills in the declarations.
-   */
-  pending: boolean;
+}
+
+/**
+ * A project as soon as it is open, before anything is read: opening is a
+ * filesystem walk, and the files are read by the scan the modal reports.
+ */
+export interface ProjectSummary {
+  label: string;
+  backend: string;
+  root: string | null;
+  /** Files the read will walk. */
+  files: number;
 }
 
 export interface GraphNode {
@@ -123,20 +130,25 @@ export interface UpdateResult {
   processing: boolean;
 }
 
+// Opening returns a summary, not a board: nothing has been parsed at that point.
 export const openProject = (path: string) =>
-  invoke<WorkspaceView>("open_project", { path });
+  invoke<ProjectSummary>("open_project", { path });
 
 export const openProjectZip = (path: string) =>
-  invoke<WorkspaceView>("open_project_zip", { path });
+  invoke<ProjectSummary>("open_project_zip", { path });
 
 export const importProjectZip = (data: string, label?: string) =>
-  invoke<WorkspaceView>("import_project_zip", { data, label: label ?? null });
+  invoke<ProjectSummary>("import_project_zip", { data, label: label ?? null });
 
 export const newMemoryProject = (label?: string) =>
-  invoke<WorkspaceView>("new_memory_project", { label: label ?? null });
+  invoke<ProjectSummary>("new_memory_project", { label: label ?? null });
 
 export const closeProject = () => invoke<void>("close_project");
 
+/** The open project, without reading it (a project given on the command line). */
+export const projectSummary = () => invoke<ProjectSummary | null>("project_summary");
+
+/** The board: only asked for once every file has been read. */
 export const workspaceView = () => invoke<WorkspaceView>("workspace_view");
 
 export const graphView = () => invoke<ProjectGraph>("graph_view");
@@ -363,6 +375,8 @@ export interface ScanState {
   /** One-line verdict once the read is over. */
   summary: string | null;
   failed: boolean;
+  /** Set when the read cannot run at all (Lean off, no toolchain, no folder). */
+  blocked: string | null;
   /** Seconds since the read started. */
   seconds: number;
 }

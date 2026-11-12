@@ -122,14 +122,6 @@ async function answerBuild(build: boolean) {
   if (build) await actions.buildLean();
 }
 
-/** What the console says before anything has run. */
-/** `3/18 files`, for the console's scan header. */
-const scanLabel = computed(() => {
-  const scan = state.scan;
-  if (!scan || scan.total === 0) return "no files to read";
-  return `${scan.done}/${scan.total} files`;
-});
-
 const emptyConsole = computed(() =>
   canBuild()
     ? "press build to run `lake build`; its output streams here"
@@ -152,7 +144,6 @@ const leanBadge = computed(() => {
   const lean = state.lean;
   if (!lean) return null;
   if (!lean.enabled) return { tone: "muted", text: "lean off" };
-  if (lean.backend !== "folder") return { tone: "muted", text: "lean n/a" };
   if (!lean.available) return { tone: "error", text: "no lean" };
   if (lean.error) return { tone: "error", text: "lean error" };
   const version = lean.version.match(/version ([\w.+-]+)/)?.[1] ?? "";
@@ -165,8 +156,6 @@ const aiRunning = computed(() => aiState.sessions.some((session) => session.runn
 /** What the header says while Lean is still working through the project. */
 const processingLabel = computed(() => {
   const files = state.processingFiles;
-  // Reading the files comes first: it is what puts declarations on the board.
-  if (state.scan?.running) return `reading ${scanLabel.value}`;
   if (!state.processing) return null;
   if (files.length === 0) return "checking…";
   if (files.length === 1) return `checking ${files[0]}`;
@@ -305,7 +294,7 @@ async function copyPrinted() {
           size="sm"
           variant="ghost"
           title="Build the project (`lake build`), with the output in a console"
-          @click="state.build || state.scan ? actions.showBuild() : actions.buildLean()"
+          @click="state.build ? actions.showBuild() : actions.buildLean()"
         >
           <UiSpinner v-if="state.busy === 'lean'" :size="10" />
           <UiIcon v-else name="refresh" :size="11" />
@@ -491,42 +480,13 @@ async function copyPrinted() {
     <UiModal
       :open="state.buildOpen"
       title="build console"
-      :subtitle="
-        state.scan?.running
-          ? state.scan.current
-            ? `reading ${scanLabel} · ${state.scan.current}`
-            : 'reading the project…'
-          : (state.build?.summary ?? state.build?.command ?? 'lake build')
-      "
+      :subtitle="state.build?.summary ?? state.build?.command ?? 'lake build'"
       :width="820"
       :height="520"
       :resizable="true"
       @close="actions.setBuildOpen(false)"
     >
       <div class="console">
-        <!-- Reading the project comes first: it is what the board is waiting for. -->
-        <div v-if="state.scan" class="console__bar">
-          <span class="k-mono console__state" :data-running="state.scan.running || undefined">
-            {{
-              state.scan.running
-                ? `reading ${scanLabel} · ${state.scan.seconds}s`
-                : (state.scan.summary ?? "nothing read yet")
-            }}
-          </span>
-          <span class="console__progress k-mono">{{ state.scan.current }}</span>
-          <span class="k-spacer" />
-          <UiButton
-            v-if="state.scan.running"
-            size="sm"
-            variant="ghost"
-            @click="actions.cancelScan()"
-          >
-            <UiIcon name="close" :size="11" /> stop reading
-          </UiButton>
-        </div>
-        <pre v-if="state.scan" class="console__output console__output--scan k-mono">{{
-          state.scan.lines.join("\n")
-        }}</pre>
         <div class="console__bar">
           <span class="k-mono console__state" :data-running="state.build?.running || undefined">
             {{ state.build?.running ? `running · ${state.build.seconds}s` : state.build?.summary ?? "no build yet" }}
@@ -619,21 +579,6 @@ async function copyPrinted() {
 
 .board__warn span:first-of-type {
   flex: 1;
-}
-
-.console__progress {
-  color: var(--text-ghost);
-  font-size: var(--fs-micro);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* The read of the project is a shorter, quieter log than the build's. */
-.console__output--scan {
-  flex: 0 0 auto;
-  max-height: 132px;
-  color: var(--text-ghost);
 }
 
 .console__output {

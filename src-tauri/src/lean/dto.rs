@@ -64,6 +64,19 @@ pub struct Stats {
     pub nodes: usize,
 }
 
+/// A project as soon as it is open, before anything is read.
+///
+/// Opening is a filesystem walk: the files are read by the parse job, and the board
+/// is built from the full [`WorkspaceView`] only once that has finished.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectSummary {
+    pub label: String,
+    pub backend: String,
+    pub root: Option<String>,
+    /// Files the read will walk, so the modal can count before it starts.
+    pub files: usize,
+}
+
 /// Everything the project page needs after opening or editing a project.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceView {
@@ -72,10 +85,6 @@ pub struct WorkspaceView {
     pub root: Option<String>,
     pub tree: Vec<TreeNode>,
     pub stats: Stats,
-    /// True when the files have not been read yet: the tree is a file listing,
-    /// and the background scan fills in the declarations.
-    #[serde(default)]
-    pub pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

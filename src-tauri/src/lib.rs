@@ -36,6 +36,7 @@ pub fn run() {
             commands::import_project_zip,
             commands::new_memory_project,
             commands::close_project,
+            commands::project_summary,
             commands::workspace_view,
             commands::scan_project,
             commands::scan_state,

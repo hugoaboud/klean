@@ -57,7 +57,13 @@ interface State {
   buildOpen: boolean;
   /** True when the editor holds text Lean has checked but the disk has not seen. */
   editorDirty: boolean;
-  /** How the background read of the project stands (null before one starts). */
+  /** True while the parse modal holds the project page back. */
+  parseOpen: boolean;
+  /** Why the read cannot run at all, if it cannot (Lean off, no toolchain). */
+  parseBlocked: string | null;
+  /** The project the parse modal is reading, for its heading. */
+  parseLabel: string;
+  /** How the read of the project stands (null before one starts). */
   scan: api.ScanState | null;
   /** True while Lean is still processing at least one file. */
   processing: boolean;
@@ -96,6 +102,9 @@ export const state = reactive<State>({
   build: null,
   buildOpen: false,
   editorDirty: false,
+  parseOpen: false,
+  parseBlocked: null,
+  parseLabel: "",
   scan: null,
   processing: false,
   processingFiles: [],
@@ -144,10 +153,8 @@ function adopt(view: api.WorkspaceView) {
   state.processing = false;
   state.processingFiles = [];
   state.scan = null;
-  // The board is on screen already (a folder project opens from its file listing).
-  // What is left — reading the files — happens in the background, where the console
-  // can show it; checking and building stay the user's call.
-  if (view.pending) void startScan();
+  state.parseOpen = false;
+  state.parseBlocked = null;
   void (async () => {
     await loadSettings();
     await loadLean();
@@ -156,7 +163,6 @@ function adopt(view: api.WorkspaceView) {
 }
 
 async function loadGraph() {
-  await waitForScan();
   const graph = await run("graph", () => api.graphView());
   if (graph) state.graph = graph;
 }
@@ -182,77 +188,89 @@ export function buildPrompt(): "ask" | "always" | "never" {
   return value === "always" || value === "never" ? value : "ask";
 }
 
-let scanTimer: number | null = null;
-/** Set when the user stops the read: its end must not reload the boards. */
-let scanStopped = false;
+let parseTimer: number | null = null;
+/** Set when the user closes the modal: the read must not open the project. */
+let parseStopped = false;
 
 /**
- * Reads the open project's files in the background.
+ * Reads a project's files, with the modal that reports it.
  *
- * Opening a project shows the file listing at once; the declarations arrive
- * afterwards. While that runs, the console reports it file by file, and the board
- * is refreshed as soon as it is done.
+ * This is the only way onto the project page: opening a folder walks the tree and
+ * stops there, the scan parses every file, and the board is built from the result.
+ * Closing the modal stops the read and closes the project, so no board is ever
+ * shown for files that were not parsed.
  */
-async function startScan() {
-  if (scanTimer !== null) {
-    window.clearTimeout(scanTimer);
-    scanTimer = null;
+async function beginParse(summary: api.ProjectSummary) {
+  // A second open replaces the first: its poll must not outlive it.
+  if (parseTimer !== null) {
+    window.clearTimeout(parseTimer);
+    parseTimer = null;
   }
-  scanStopped = false;
-  const scan = await api.leanScan().catch(() => null);
+  parseStopped = false;
+  state.parseOpen = true;
+  state.parseBlocked = null;
+  state.scan = null;
+  state.notice = null;
+  state.error = null;
+  state.page = "welcome";
+  state.parseLabel = summary.label;
+  const scan = await api.leanScan().catch((error) => {
+    state.parseBlocked = error instanceof Error ? error.message : String(error);
+    return null;
+  });
   if (!scan) return;
   state.scan = scan;
-  watchScan();
+  // Nothing can be read here: Lean is off, there is no toolchain, or this is not a
+  // folder. The modal says so and offers to open the project as it is.
+  if (scan.blocked) {
+    state.parseBlocked = scan.blocked;
+    return;
+  }
+  if (!scan.running) {
+    await finishParse();
+    return;
+  }
+  pollParse();
 }
 
-/** Polls the scan, and reloads the board once the files are read. */
-function watchScan() {
-  if (scanTimer !== null) return;
+/** Follows the read, then puts the board on screen. */
+function pollParse() {
+  if (parseTimer !== null) return;
   const tick = async () => {
     const scan = await api.leanScanState().catch(() => null);
+    if (parseStopped) {
+      parseTimer = null;
+      return;
+    }
     if (!scan) {
-      scanTimer = null;
+      parseTimer = null;
       return;
     }
     state.scan = scan;
     if (scan.running) {
-      scanTimer = window.setTimeout(tick, 300);
+      parseTimer = window.setTimeout(tick, 200);
       return;
     }
-    scanTimer = null;
-    // Stopped by the user: the boards keep what they have rather than pulling in
-    // the files that were just refused.
-    if (scanStopped) return;
-    await refreshAfterScan();
+    parseTimer = null;
+    await finishParse();
   };
-  scanTimer = window.setTimeout(tick, 300);
+  parseTimer = window.setTimeout(tick, 200);
 }
 
-/** Fills the tree in once the read is over. */
-async function refreshAfterScan() {
-  const view = await api.workspaceView().catch(() => null);
-  if (view) state.view = view;
-  await reloadBoards();
-  const id = state.detail?.id;
-  if (id && state.editorOpen) {
-    const detail = await api.nodeDetail(id).catch(() => null);
-    if (detail) state.detail = detail;
+/** Every file is in: build the board and hand the project page over. */
+async function finishParse() {
+  if (parseStopped) return;
+  const view = await api.workspaceView().catch((error) => {
+    state.error = error instanceof Error ? error.message : String(error);
+    return null;
+  });
+  if (!view) {
+    state.parseOpen = false;
+    return;
   }
-}
-
-/**
- * Waits for the background read, for the boards that need the files: the graph
- * and the logic tree are built from declarations, not from file names.
- */
-async function waitForScan(): Promise<void> {
-  const deadline = Date.now() + 120000;
-  while (state.scan?.running && Date.now() < deadline) {
-    // Asked of Rust, not of the poller: the boards must not depend on it.
-    const scan = await api.leanScanState().catch(() => null);
-    if (!scan || !scan.running) return;
-    state.scan = scan;
-    await new Promise((resolve) => window.setTimeout(resolve, 200));
-  }
+  adopt(view);
+  await Promise.all([loadGraph(), loadRecents()]);
+  if (state.boardView === "logic") void loadLogic();
 }
 
 /** Reads the build console from Rust (cheap: it is a snapshot). */
@@ -429,7 +447,6 @@ function mergePositions(
  * and the logic view can never disagree after an edit.
  */
 async function reloadBoards() {
-  await waitForScan();
   const [graph, logic] = await Promise.all([
     api.graphView(),
     api.logicGraph(state.openTheory || null),
@@ -522,19 +539,11 @@ export const actions = {
     await loadRecents();
     try {
       // Only a project given on the command line is open at this point.
-      const view = await api.workspaceView();
-      state.view = view;
-      state.page = "project";
-      // A project given on the command line opens the same way as any other: the
-      // listing first, the files in the background.
-      if (view.pending) void startScan();
-      // Settings and Lean's status come from the project, not from its files, so
-      // they do not wait for the read; the boards do.
-      await Promise.all([loadSettings(), loadLean()]);
-      void pollBuild();
-      // A board that starts on the logic view needs its graph loaded too.
-      if (state.boardView === "logic") void loadLogic();
-      void loadGraph();
+      const summary = await api.projectSummary();
+      if (!summary) return;
+      // It opens like any other project: the files are read first, with the modal
+      // reporting them, and the board follows.
+      await beginParse(summary);
     } catch {
       state.page = "welcome";
     }
@@ -546,21 +555,19 @@ export const actions = {
 
   async openFolder(path: string) {
     await flushPending();
-    const view = await run("open", () => api.openProject(path));
-    if (!view) return;
-    adopt(view);
+    const summary = await run("open", () => api.openProject(path));
+    if (!summary) return;
     await loadRecents();
-    // A folder project fills itself in from the background read; an archive or an
-    // in-memory workspace is complete the moment it opens.
-    if (!view.pending) await loadGraph();
+    // A folder project is read before its board exists: the modal reports the read,
+    // and closing it closes the project again.
+    await beginParse(summary);
   },
 
   async openZip(path: string) {
     await flushPending();
-    const view = await run("open", () => api.openProjectZip(path));
-    if (!view) return;
-    adopt(view);
-    await Promise.all([loadGraph(), loadRecents()]);
+    const summary = await run("open", () => api.openProjectZip(path));
+    if (!summary) return;
+    await beginParse(summary);
   },
 
   async openRecent(entry: api.RecentProject) {
@@ -570,18 +577,56 @@ export const actions = {
 
   async importZip(data: string, label?: string) {
     await flushPending();
-    const view = await run("open", () => api.importProjectZip(data, label));
-    if (!view) return;
-    adopt(view);
-    await loadGraph();
+    const summary = await run("open", () => api.importProjectZip(data, label));
+    if (!summary) return;
+    await beginParse(summary);
   },
 
   async newMemory(label?: string) {
     await flushPending();
-    const view = await run("open", () => api.newMemoryProject(label));
-    if (!view) return;
-    adopt(view);
-    await loadGraph();
+    const summary = await run("open", () => api.newMemoryProject(label));
+    if (!summary) return;
+    await beginParse(summary);
+  },
+
+  /**
+   * Stops reading and puts the project away.
+   *
+   * The parse modal's close button does this: stopping the read leaves no board to
+   * show, so the project is closed rather than opened half-read.
+   */
+  async cancelParse() {
+    if (!state.parseOpen) return;
+    parseStopped = true;
+    if (parseTimer !== null) {
+      window.clearTimeout(parseTimer);
+      parseTimer = null;
+    }
+    state.parseOpen = false;
+    state.parseBlocked = null;
+    const label = state.parseLabel;
+    state.parseLabel = "";
+    state.scan = null;
+    await api.leanScanCancel().catch(() => undefined);
+    await api.closeProject().catch(() => undefined);
+    state.page = "welcome";
+    state.view = null;
+    state.graph = null;
+    state.logic = null;
+    setSelection([]);
+    state.detail = null;
+    state.editorOpen = false;
+    state.notice = `stopped reading ${label || "the project"}: nothing was opened`;
+    await loadRecents();
+  },
+
+  /**
+   * Opens the project anyway, when its files cannot be read at all (Lean switched
+   * off, no toolchain). The board then shows the file tree with no declarations.
+   */
+  async parseAnyway() {
+    state.parseBlocked = null;
+    await finishParse();
   },
 
   /**
@@ -726,13 +771,6 @@ export const actions = {
   },
 
   /** Stops the background read; what was read stays. */
-  async cancelScan() {
-    scanStopped = true;
-    await api.leanScanCancel().catch(() => undefined);
-    const scan = await api.leanScanState().catch(() => null);
-    if (scan) state.scan = scan;
-  },
-
   /** Stops a running build. */
   async cancelBuild() {
     const build = await run("build", () => api.leanBuildCancel()).catch(() => null);

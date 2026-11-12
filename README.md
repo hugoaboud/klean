@@ -144,13 +144,14 @@ rm -rf ~/.local/share/com.aboud.klean
 ## Layout
 
 ```
-lean4-ast/                   Lean's own parser, as a static library + Rust crate
+../lean4-ast/                Lean's own parser, as a static library + Rust crate
+                             (a sibling checkout, not vendored here)
   build.py                   pulls the pinned lean4 tag, extracts it, builds the
                              library and runs the crate's tests
   manifest.json              which lean4 files matter, and why (verified by build.py)
-  wrapper/KleanAst.lean      thin wrapper: Lean.Parser → JSON syntax tree
-  shim/klean_ast_shim.c      starts the Lean runtime, exposes three C functions
-  crates/klean-ast/          the Rust API and its per-feature tests
+  wrapper/Lean4Ast.lean      thin wrapper: Lean.Parser, tree handed back as it is
+  shim/                      starts the Lean runtime, passes the tree's objects across
+  crates/lean4-ast/          the Rust API: reads Lean's heap, borrows or copies it
 src-tauri/src/lean/          the engine (no UI concerns)
   fs.rs                      project storage on rust-vfs: PhysicalFS on disk,
                              MemoryFS for archives, zip import/export, ignored dirs
@@ -182,9 +183,14 @@ expansion is *not* view state — Rust owns it).
 KLEAN contains no Lean parser. Everything the board shows is what the official
 implementation reported:
 
-- **syntax tree** — `lean4-ast/` builds Lean's *parser* into a static library that KLEAN
+- **syntax tree** — `../lean4-ast/` builds Lean's *parser* into a static library that KLEAN
   links: `Lean.Parser.parseHeader` + `parseCommand`, no elaboration. Parsing a file is a
-  library call in this process (microseconds), so no project file ever spawns a process.
+  library call in this process, so no project file ever spawns a process, and the tree
+  crosses into Rust as the `lean_object*` Lean built — nothing is serialised on the way.
+  KLEAN then reads that tree **where Lean left it** (`ast::Syntax`, implemented by Lean's
+  borrowed `Syntax` view), never copying it out of the heap unless it needs to: on a 22 KB
+  file of 480 declarations, parsing and mapping costs 132 ms, against 291 ms for the same
+  work through an owned copy of the tree.
   A file is parsed twice when it imports something — once to read the imports, once with
   their syntax extensions loaded — and if an import has not been built yet the tree falls
   back to core syntax instead of disappearing.
@@ -275,11 +281,15 @@ reasoning is shown when the provider exposes it (`reasoning_content` on DeepSeek
 
 ### What opening a project costs
 
-Opening a project parses **nothing**: the board is built from the file listing, so it is on
-screen in a few hundred milliseconds however large the project is. The declarations arrive
-afterwards, from a background job (`src-tauri/src/lean/scan.rs`) that reads the files one at
-a time and reports into the build console — `3/16 files · Core/Types.lean` — with a stop
-button. Until it reaches a file, that file's node says `not parsed yet`.
+Opening a project walks the file tree and parses **nothing** — that much is instant however
+large the project is. The files are then read by a background job
+(`src-tauri/src/lean/scan.rs`), one at a time, and the **parse modal**
+(`src/components/ParseModal.vue`) reports it: a linear bar over the files, `3 / 16 files`,
+the file being read and the seconds it took. The project page appears when the last file is
+in — there is no board before that, and no file on it that has not been parsed. Closing the
+modal stops the read and closes the project, so nothing is ever opened half-read; a project
+whose files cannot be read at all (Lean switched off, no toolchain) says why and offers to
+open anyway.
 
 The read reuses **one** Lean environment (`Init`/`Lean`) for the whole project: no project
 module is loaded, so memory does not grow with the project. Measured here: 150 files and
@@ -287,11 +297,13 @@ module is loaded, so memory does not grow with the project. Measured here: 150 f
 
 - **Building that environment is the one slow step** — Lean imports its own `Init` and
   `Lean` modules, seconds rather than milliseconds — so it happens on the scan's own thread,
-  *off* the project lock, and everything after it is milliseconds. While it runs, commands
-  that would need the parser answer with a note instead of queueing behind it.
-- **Parsing** a file is microseconds. Only the file you open in the editor is re-parsed with
-  *its* imports loaded, and only once the project has been built; the parser keeps at most
-  two such environments, so a session cannot accumulate them.
+  *off* the project lock, and everything after it is milliseconds. The modal says
+  "preparing Lean's parser…" while it runs, and commands that would need the parser answer
+  with a note instead of queueing behind it.
+- **Parsing** a file is a library call over Lean's own syntax tree: ~0.1 ms per command
+  here, and nothing is copied out of Lean's heap. Only the file you open in the editor is
+  re-parsed with *its* imports loaded, and only once the project has been built; the parser
+  keeps at most two such environments, so a session cannot accumulate them.
 - **Checking** is per file: opening a node hands that one file to the language server, which
   keeps its own process and reports diagnostics as it finds them. Editing a node sends only
   that file's change (one replaced range) and re-checks only that file; the rest of the

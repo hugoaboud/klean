@@ -34,8 +34,9 @@ serde_json = "1"
 
 # Lean project engine
 vfs = "0.13"
-# Lean's own parser, as a static library (see lean4-ast/)
-klean-ast = { path = "../lean4-ast/crates/klean-ast" }
+# Lean's own parser, as a static library (see lean4-ast/): the tree is read
+# straight out of Lean's heap, so nothing is serialised on the way.
+lean4-ast = { path = "../../lean4-ast/crates/lean4-ast" }
 # AI sessions: providers, streaming and the MCP tools the model may call.
 klean-ai = { path = "klean-ai" }
 # Only used by the in-app Lean toolchain installer.
