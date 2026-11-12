@@ -16,6 +16,8 @@ import UiSpinner from "../components/ui/UiSpinner.vue";
 import UiSplitPane from "../components/ui/UiSplitPane.vue";
 import LogicPage from "./LogicPage.vue";
 import SettingsModal from "../components/SettingsModal.vue";
+import AiModal from "../components/AiModal.vue";
+import { aiActions, aiState } from "../store/ai";
 import { actions, aiEnabled, buildPrompt, canBuild, state } from "../store/workspace";
 
 const split = ref(0.44);
@@ -54,6 +56,15 @@ function pickFromGraph(id: string, additive: boolean) {
   else void actions.select(id);
 }
 
+/** The editor's prompt: an AI session seeded with the node being edited. */
+async function askAboutNode(text: string) {
+  const detail = state.detail;
+  if (!detail) return;
+  const title = detail.name ?? detail.label;
+  const id = await aiActions.start("editor", title, [detail.id]);
+  if (id) await aiActions.send(text, id);
+}
+
 async function onSaveSettings(values: [string, string][]) {
   if (await actions.saveSettings(values)) actions.setSettingsOpen(false);
 }
@@ -61,6 +72,30 @@ async function onSaveSettings(values: [string, string][]) {
 /** `action` rows in settings: only the Lean installer has one. */
 function onSettingAction(id: string) {
   if (id === "lean.action.install") void actions.installLean();
+}
+
+/** The editor's close confirmation, like the settings modal's. */
+const editorConfirm = ref(false);
+
+/** Closing the editor: an unsaved edit asks first, then goes. */
+function requestEditorClose() {
+  if (state.editorDirty) {
+    editorConfirm.value = true;
+    return;
+  }
+  actions.closeEditor();
+}
+
+/** Discards the unsaved edit and closes. */
+async function discardAndClose() {
+  editorConfirm.value = false;
+  await actions.discardDraft();
+  actions.closeEditor();
+}
+
+/** Keeps the edit and closes nothing. */
+function keepEditing() {
+  editorConfirm.value = false;
 }
 
 /** The build question, asked once per project unless the answer is remembered. */
@@ -88,6 +123,13 @@ async function answerBuild(build: boolean) {
 }
 
 /** What the console says before anything has run. */
+/** `3/18 files`, for the console's scan header. */
+const scanLabel = computed(() => {
+  const scan = state.scan;
+  if (!scan || scan.total === 0) return "no files to read";
+  return `${scan.done}/${scan.total} files`;
+});
+
 const emptyConsole = computed(() =>
   canBuild()
     ? "press build to run `lake build`; its output streams here"
@@ -117,9 +159,14 @@ const leanBadge = computed(() => {
   return { tone: "ok", text: `lean ${version || lean.origin}` };
 });
 
+/** True while any AI session is waiting on a model. */
+const aiRunning = computed(() => aiState.sessions.some((session) => session.running));
+
 /** What the header says while Lean is still working through the project. */
 const processingLabel = computed(() => {
   const files = state.processingFiles;
+  // Reading the files comes first: it is what puts declarations on the board.
+  if (state.scan?.running) return `reading ${scanLabel.value}`;
   if (!state.processing) return null;
   if (files.length === 0) return "checking…";
   if (files.length === 1) return `checking ${files[0]}`;
@@ -221,6 +268,17 @@ async function copyPrinted() {
       <span class="k-spacer" />
 
       <div class="board__actions">
+        <UiButton
+          size="sm"
+          variant="ghost"
+          class="board__ai"
+          title="AI sessions"
+          @click="aiActions.show()"
+        >
+          <UiIcon name="ai" :size="12" />
+          AI
+          <span v-if="aiRunning" class="board__ai-dot" />
+        </UiButton>
         <button
           v-if="leanBadge"
           class="board__lean k-mono"
@@ -232,16 +290,22 @@ async function copyPrinted() {
           <UiSpinner v-if="state.lean?.building" :size="9" />
           {{ leanBadge.text }}
         </button>
-        <span v-if="processingLabel" class="board__processing k-mono" :title="processingLabel">
+        <button
+          v-if="processingLabel"
+          class="board__processing k-mono"
+          type="button"
+          :title="`${processingLabel} — open the console to follow it`"
+          @click="actions.showBuild()"
+        >
           <UiSpinner :size="9" />
           {{ processingLabel }}
-        </span>
+        </button>
         <UiButton
           v-if="canBuild()"
           size="sm"
           variant="ghost"
           title="Build the project (`lake build`), with the output in a console"
-          @click="state.build ? actions.showBuild() : actions.buildLean()"
+          @click="state.build || state.scan ? actions.showBuild() : actions.buildLean()"
         >
           <UiSpinner v-if="state.busy === 'lean'" :size="10" />
           <UiIcon v-else name="refresh" :size="11" />
@@ -339,6 +403,8 @@ async function copyPrinted() {
 
     <UiSnackbar :mode="state.boardView" @change="actions.setBoardView($event)" />
 
+    <AiModal />
+
     <UiModal
       :open="state.editorOpen"
       :title="state.detail?.name ?? state.detail?.label ?? ''"
@@ -347,8 +413,14 @@ async function copyPrinted() {
       :width="640"
       :height="470"
       :resizable="true"
-      @close="actions.closeEditor()"
+      @close="requestEditorClose"
     >
+      <div v-if="editorConfirm" class="board__warn">
+        <UiIcon name="alert" :size="12" />
+        <span>discard the unsaved edit?</span>
+        <UiButton size="sm" variant="ghost" @click="keepEditing">keep editing</UiButton>
+        <UiButton size="sm" variant="solid" @click="discardAndClose">discard</UiButton>
+      </div>
       <NodeEditor
         :detail="state.detail"
         :ai-enabled="aiOn"
@@ -359,9 +431,13 @@ async function copyPrinted() {
         :term="state.term"
         :term-busy="state.termBusy"
         :processing="editorProcessing"
-        @apply="actions.applyText"
+        @preview="actions.previewText"
+        @save="actions.applyText"
+        @dirty="(value: boolean) => (state.editorDirty = value)"
+        @revert="actions.discardDraft"
         @comments="actions.applyComments"
         @rename="actions.rename"
+        @prompt="askAboutNode"
         @goals="(line: number, character: number) => {
           void actions.loadGoals(line, character);
           void actions.loadTerm(line, character);
@@ -415,13 +491,42 @@ async function copyPrinted() {
     <UiModal
       :open="state.buildOpen"
       title="build console"
-      :subtitle="state.build?.summary ?? state.build?.command ?? 'lake build'"
+      :subtitle="
+        state.scan?.running
+          ? state.scan.current
+            ? `reading ${scanLabel} · ${state.scan.current}`
+            : 'reading the project…'
+          : (state.build?.summary ?? state.build?.command ?? 'lake build')
+      "
       :width="820"
       :height="520"
       :resizable="true"
       @close="actions.setBuildOpen(false)"
     >
       <div class="console">
+        <!-- Reading the project comes first: it is what the board is waiting for. -->
+        <div v-if="state.scan" class="console__bar">
+          <span class="k-mono console__state" :data-running="state.scan.running || undefined">
+            {{
+              state.scan.running
+                ? `reading ${scanLabel} · ${state.scan.seconds}s`
+                : (state.scan.summary ?? "nothing read yet")
+            }}
+          </span>
+          <span class="console__progress k-mono">{{ state.scan.current }}</span>
+          <span class="k-spacer" />
+          <UiButton
+            v-if="state.scan.running"
+            size="sm"
+            variant="ghost"
+            @click="actions.cancelScan()"
+          >
+            <UiIcon name="close" :size="11" /> stop reading
+          </UiButton>
+        </div>
+        <pre v-if="state.scan" class="console__output console__output--scan k-mono">{{
+          state.scan.lines.join("\n")
+        }}</pre>
         <div class="console__bar">
           <span class="k-mono console__state" :data-running="state.build?.running || undefined">
             {{ state.build?.running ? `running · ${state.build.seconds}s` : state.build?.summary ?? "no build yet" }}
@@ -496,6 +601,39 @@ async function copyPrinted() {
 
 .console__state[data-running] {
   color: var(--accent);
+}
+
+/* The editor's unsaved-changes row: the settings modal's, in the same colours. */
+.board__warn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 12px 8px;
+  padding: 6px 8px;
+  border: 1px solid rgba(194, 166, 112, 0.36);
+  border-radius: var(--radius);
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: var(--fs-xs);
+}
+
+.board__warn span:first-of-type {
+  flex: 1;
+}
+
+.console__progress {
+  color: var(--text-ghost);
+  font-size: var(--fs-micro);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The read of the project is a shorter, quieter log than the build's. */
+.console__output--scan {
+  flex: 0 0 auto;
+  max-height: 132px;
+  color: var(--text-ghost);
 }
 
 .console__output {
@@ -642,6 +780,28 @@ async function copyPrinted() {
   gap: 4px;
 }
 
+.board__ai {
+  gap: 4px;
+}
+
+.board__ai-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: ai-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes ai-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 .board__processing {
   display: inline-flex;
   align-items: center;
@@ -650,8 +810,17 @@ async function copyPrinted() {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+  padding: 0;
+  border: none;
+  background: none;
   color: var(--accent);
   font-size: var(--fs-micro);
+  cursor: pointer;
+}
+
+.board__processing:hover {
+  color: var(--accent-bright);
+  text-decoration: underline;
 }
 
 .board__lean {

@@ -57,6 +57,11 @@ export interface WorkspaceView {
   root: string | null;
   tree: TreeNode[];
   stats: Stats;
+  /**
+   * True when the files have not been read yet: the tree is the file listing, and
+   * the background scan fills in the declarations.
+   */
+  pending: boolean;
 }
 
 export interface GraphNode {
@@ -223,6 +228,8 @@ export interface SettingNode {
   help: string;
   /** Setting that must be switched on for this one to be shown. */
   depends_on: string | null;
+  /** True for a value written over several lines: rendered as a text area. */
+  multiline: boolean;
   children: SettingNode[];
 }
 
@@ -338,6 +345,57 @@ export interface BuildState {
   /** Seconds since the build started. */
   seconds: number;
 }
+
+/**
+ * How the background read of the project stands: KLEAN parses every file after a
+ * project opens, and this is what the console follows.
+ */
+export interface ScanState {
+  running: boolean;
+  /** Files to read. */
+  total: number;
+  /** Files read so far. */
+  done: number;
+  /** The file being read. */
+  current: string;
+  /** Progress lines, oldest first. */
+  lines: string[];
+  /** One-line verdict once the read is over. */
+  summary: string | null;
+  failed: boolean;
+  /** Seconds since the read started. */
+  seconds: number;
+}
+
+/** Reads the open project's files in the background; returns at once. */
+export const leanScan = () => invoke<ScanState>("scan_project");
+
+/** How the background read stands. */
+export const leanScanState = () => invoke<ScanState>("scan_state");
+
+/** Stops the background read. */
+export const leanScanCancel = () => invoke<void>("scan_cancel");
+
+/**
+ * The answer to a keystroke: the node as it now reads and what Lean says about it.
+ * Nothing is written to disk.
+ */
+export interface PreviewResult {
+  id: string;
+  detail: NodeDetail;
+  diagnostics: DiagnosticDto[];
+  /** True when Lean reported no errors for the edited file. */
+  ok: boolean;
+  /** True while the server is still checking: ask again shortly. */
+  processing: boolean;
+}
+
+/** Checks an edited node without saving it; the text goes to Lean at once. */
+export const previewNode = (id: string, text: string) =>
+  invoke<PreviewResult>("preview_node", { id, text });
+
+/** Throws an unsaved edit away and re-checks the file as it is on disk. */
+export const discardDraft = (id: string) => invoke<void>("discard_draft", { id });
 
 /** Starts `lake build` in the background and returns immediately. */
 export const leanBuild = () => invoke<BuildState>("lean_build");

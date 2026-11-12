@@ -3,8 +3,10 @@
 // right-hand panel that shows what Lean says — the goals left to prove and the
 // errors and warnings inside this node.
 //
-// Edits are flushed to Rust with a short debounce, and Ctrl/Cmd+S flushes now;
-// each flush re-checks the file through the Lean toolchain.
+// Typing is checked, not saved. Every pause sends the edited declaration to Rust,
+// which splices it into the file *in memory* and hands it to Lean: diagnostics come
+// back without a write. The file on disk changes only when the user saves
+// (Ctrl/Cmd+S), and closing with unsaved changes asks first.
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import hljs from "../lib/highlight";
 import type { Goals, NodeDetail } from "../api/lean";
@@ -30,12 +32,21 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  apply: [string];
+  /** The edited text, for Lean to check — nothing is written. */
+  preview: [string];
+  /** Save it: this is what reaches the disk. */
+  save: [string];
+  /** Whether there is an unsaved edit, for the close confirmation. */
+  dirty: [boolean];
+  /** Put the saved text back, in front of Lean too. */
+  revert: [];
   comments: [string];
   rename: [string];
   file: [];
   /** Caret moved: file-absolute 1-based line, UTF-16 column. */
   goals: [number, number];
+  /** Ask the AI about this node: an AI session seeded with it. */
+  prompt: [string];
 }>();
 
 const text = ref("");
@@ -61,6 +72,8 @@ const name = ref("");
 const dirty = ref(false);
 let timer: number | undefined;
 
+watch(dirty, (value) => emit("dirty", value));
+
 const editable = computed(() => props.detail?.editable ?? false);
 const markers = computed(() =>
   (props.detail?.diagnostics ?? []).map((diagnostic) => ({
@@ -74,8 +87,8 @@ const status = computed(() => {
   if (props.saveError) return { tone: "error", label: props.saveError };
   if (props.processing) return { tone: "busy", label: "lean is checking…" };
   if (props.saving) return { tone: "busy", label: "saving…" };
-  if (dirty.value) return { tone: "dirty", label: "unsaved" };
-  return { tone: "ok", label: "in sync" };
+  if (dirty.value) return { tone: "dirty", label: "unsaved — checked in memory" };
+  return { tone: "ok", label: "saved" };
 });
 
 /** Errors and warnings inside the node, worst first. */
@@ -166,8 +179,17 @@ function onInput(value: string) {
   text.value = value;
   if (!editable.value) return;
   dirty.value = true;
+  // Check as the user types: Lean gets the text long before the disk does, so the
+  // goals and the errors follow the caret instead of the save button.
   window.clearTimeout(timer);
-  timer = window.setTimeout(flush, 750);
+  timer = window.setTimeout(check, 150);
+}
+
+/** Sends the text for checking. Cheap: one node, no disk, no project walk. */
+function check() {
+  window.clearTimeout(timer);
+  if (!editable.value) return;
+  emit("preview", text.value);
 }
 
 /**
@@ -181,18 +203,25 @@ function onCaret(line: number, character: number) {
   emit("goals", detail.start_line + line - 1, first + character);
 }
 
-function flush() {
+/** Saves what is in the editor. The only path that writes to disk. */
+function save() {
   window.clearTimeout(timer);
   if (!dirty.value || !editable.value) return;
-  const snapshot = text.value;
   dirty.value = false;
-  emit("apply", snapshot);
+  emit("save", text.value);
 }
 
+/**
+ * Puts the saved text back, in the editor and in front of Lean.
+ *
+ * The editor must not read it from `detail` — that is the *draft*, which is what is
+ * being discarded. Reverting asks Rust to drop the draft, and the reloaded detail
+ * comes back with the saved text.
+ */
 function revert() {
   window.clearTimeout(timer);
-  text.value = props.detail?.text ?? "";
   dirty.value = false;
+  emit("revert");
 }
 
 let commentTimer: number | undefined;
@@ -203,9 +232,12 @@ function onCommentsInput(value: string) {
   commentTimer = window.setTimeout(() => emit("comments", comments.value), 750);
 }
 
-/** Placeholder: the prompt box is wired up later. */
+/** Sends what is in the prompt box as an AI request about this node. */
 function sendPrompt() {
+  const text = prompt.value.trim();
+  if (!text) return;
   prompt.value = "";
+  emit("prompt", text);
 }
 
 function flushComments() {
@@ -285,7 +317,7 @@ onBeforeUnmount(() => {
             :markers="markers"
             @update:model-value="onInput"
             @caret="onCaret"
-            @commit="flush"
+            @commit="save"
           />
           <pre v-else class="node-editor__readonly">{{ detail.text }}</pre>
         </div>
@@ -385,7 +417,14 @@ onBeforeUnmount(() => {
       <UiButton size="sm" variant="ghost" @click="emit('file')" title="Show the file this term comes from">
         <UiIcon name="outline" :size="11" /> file
       </UiButton>
-      <UiButton v-if="detail.editable" size="sm" variant="solid" :disabled="!dirty" @click="flush">
+      <UiButton
+        v-if="detail.editable"
+        size="sm"
+        variant="solid"
+        :disabled="!dirty"
+        title="Write the file to disk (Ctrl/Cmd+S)"
+        @click="save"
+      >
         <UiIcon name="save" :size="11" /> save
       </UiButton>
     </footer>
@@ -455,6 +494,23 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 5px;
+}
+
+/* The state panel is read at a glance while typing, so it runs a step larger than
+   the rest of the modal: one scale here covers the labels, the goals, the hints and
+   the diagnostics. */
+.node-editor__side .k-label {
+  font-size: calc(var(--fs-micro) * 1.2);
+}
+
+.node-editor__side .node-editor__goal,
+.node-editor__side .node-editor__hint,
+.node-editor__side .node-editor__diagnostic {
+  font-size: calc(var(--fs-xs) * 1.2);
+}
+
+.node-editor__side .node-editor__count {
+  font-size: calc(9px * 1.2);
 }
 
 .node-editor__count {

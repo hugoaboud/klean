@@ -6,9 +6,21 @@ import UiButton from "../components/ui/UiButton.vue";
 import UiCard from "../components/ui/UiCard.vue";
 import UiIcon from "../components/ui/UiIcon.vue";
 import UiSpinner from "../components/ui/UiSpinner.vue";
+import type { RecentProject } from "../api/lean";
 import { actions, state } from "../store/workspace";
 
-const busy = ref<"folder" | "zip" | "memory" | null>(null);
+const busy = ref<"folder" | "zip" | "memory" | "recent" | null>(null);
+
+/** Opens a project from the recent list, with the same feedback as the buttons. */
+async function openRecent(entry: RecentProject) {
+  if (busy.value !== null) return;
+  busy.value = "recent";
+  try {
+    await actions.openRecent(entry);
+  } finally {
+    busy.value = null;
+  }
+}
 
 async function pickFolder() {
   busy.value = "folder";
@@ -89,9 +101,11 @@ async function newMemory() {
           class="welcome__recent"
           type="button"
           :title="entry.path"
-          @click="actions.openRecent(entry)"
+          :disabled="busy !== null"
+          @click="openRecent(entry)"
         >
-          <UiIcon :name="entry.kind === 'zip' ? 'archive' : 'folder'" :size="11" />
+          <UiSpinner v-if="busy === 'recent'" :size="11" />
+          <UiIcon v-else :name="entry.kind === 'zip' ? 'archive' : 'folder'" :size="11" />
           <span class="welcome__recent-label">{{ entry.label }}</span>
           <span class="welcome__recent-path k-mono">{{ entry.path }}</span>
         </button>

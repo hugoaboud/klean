@@ -14,6 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -245,13 +246,13 @@ impl Engine {
         }
     }
 
-    /// Points the parser at this project: the toolchain's own modules plus the
-    /// project's build output, so `import` lines resolve to real syntax
-    /// extensions instead of being parsed as core-only.
-    fn start_parser(&mut self) -> LeanResult<()> {
-        if self.parser_ready {
-            return Ok(());
-        }
+    /// Where the parser looks for modules: the toolchain's own libraries plus the
+    /// project's build output, so `import` lines resolve to real syntax extensions
+    /// instead of being parsed as core-only.
+    ///
+    /// Cheap enough to ask for on its own: building the environment for these is
+    /// the expensive part, and that happens on the first parse.
+    pub fn parser_options(&self) -> LeanResult<Options> {
         let root = self
             .root
             .clone()
@@ -274,6 +275,50 @@ impl Engine {
                 options.search_path.push(candidate);
             }
         }
+        Ok(options)
+    }
+
+    /// `lake env lean --stdin --json`, rooted at the project.
+    ///
+    /// `lake env` is what puts the project's dependencies on Lean's search path, so
+    /// an expression that uses Mathlib (or anything else the project requires) can be
+    /// checked at all.
+    pub fn lake_env_lean(&self) -> LeanResult<Command> {
+        let root = self
+            .root
+            .clone()
+            .ok_or_else(|| LeanError::msg("Lean checks need a folder project"))?;
+        let toolchain = self.toolchain()?.clone();
+        let mut command = toolchain.lake_command().ok_or_else(|| {
+            LeanError::msg("no `lake` next to this Lean: cannot run Lean over the project")
+        })?;
+        command
+            .arg("env")
+            .arg("lean")
+            .arg("--stdin")
+            .arg("--json")
+            .current_dir(root);
+        Ok(command)
+    }
+
+    /// Where `lake build` puts this project's `.olean` files, when it has run.
+    pub fn built_module_dir(&self) -> Option<PathBuf> {
+        let root = self.root.as_ref()?;
+        let directory = root.join(".lake/build/lib/lean");
+        directory.is_dir().then_some(directory)
+    }
+
+    /// How long one Lean operation may take, in seconds.
+    pub fn timeout_seconds(&self) -> u64 {
+        self.settings.timeout
+    }
+
+    /// Points the parser at this project.
+    fn start_parser(&mut self) -> LeanResult<()> {
+        if self.parser_ready {
+            return Ok(());
+        }
+        let options = self.parser_options()?;
         match klean_ast::init(&options) {
             Ok(info) => {
                 self.parser_ready = true;

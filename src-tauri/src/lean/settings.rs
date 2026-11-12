@@ -41,6 +41,10 @@ pub struct SettingNode {
     /// `ai.enabled` for everything under the AI group.
     #[serde(default)]
     pub depends_on: Option<String>,
+    /// True for a value written over several lines: the settings modal gives it a
+    /// text area instead of a one-line field.
+    #[serde(default)]
+    pub multiline: bool,
     pub children: Vec<SettingNode>,
 }
 
@@ -61,6 +65,7 @@ impl SettingNode {
             options: Vec::new(),
             help: help.to_string(),
             depends_on: None,
+            multiline: false,
             children,
         }
     }
@@ -74,7 +79,16 @@ impl SettingNode {
             options: Vec::new(),
             help: help.to_string(),
             depends_on: None,
+            multiline: false,
             children: Vec::new(),
+        }
+    }
+
+    /// A text setting written over several lines, e.g. a prompt.
+    fn text_area(id: &str, label: &str, value: &str, help: &str) -> SettingNode {
+        SettingNode {
+            multiline: true,
+            ..Self::text(id, label, value, help)
         }
     }
 
@@ -87,6 +101,7 @@ impl SettingNode {
             options: Vec::new(),
             help: help.to_string(),
             depends_on: None,
+            multiline: false,
             children: Vec::new(),
         }
     }
@@ -100,6 +115,7 @@ impl SettingNode {
             options: Vec::new(),
             help: help.to_string(),
             depends_on: None,
+            multiline: false,
             children: Vec::new(),
         }
     }
@@ -113,6 +129,7 @@ impl SettingNode {
             options: options.iter().map(|option| option.to_string()).collect(),
             help: help.to_string(),
             depends_on: None,
+            multiline: false,
             children: Vec::new(),
         }
     }
@@ -142,6 +159,7 @@ pub fn tree(values: &BTreeMap<String, String>) -> Vec<SettingNode> {
     };
 
     let ai_enabled = get(AI_ENABLED, "false") == "true";
+    let tool_enabled = |name: &str| get(&format!("ai.tools.{name}"), "true") == "true";
 
     let model = SettingNode::group(
         "ai.model",
@@ -151,21 +169,39 @@ pub fn tree(values: &BTreeMap<String, String>) -> Vec<SettingNode> {
             SettingNode::choice(
                 "ai.model.type",
                 "Type",
-                &get("ai.model.type", "DeepSeek"),
-                &["DeepSeek"],
-                "Provider family.",
+                &get("ai.model.type", "deepseek"),
+                &["deepseek", "claude", "openai"],
+                "deepseek: DeepSeek's API. claude: Anthropic's Messages API. openai: anything that speaks /chat/completions.",
+            ),
+            SettingNode::text(
+                "ai.model.name",
+                "Model",
+                &get("ai.model.name", ""),
+                "Model name, e.g. `deepseek-reasoner`, `claude-sonnet-4-20250514`, `gpt-4o-mini`. Empty uses the provider's default.",
             ),
             SettingNode::text(
                 "ai.model.url",
                 "URL",
-                &get("ai.model.url", "https://api.deepseek.com"),
-                "Base URL of the API.",
+                &get("ai.model.url", ""),
+                "Base URL. Empty uses the provider's own (DeepSeek, Anthropic, OpenAI).",
             ),
             SettingNode::text(
                 "ai.model.api_key",
                 "API Key",
                 &get("ai.model.api_key", ""),
                 "Kept in .klean.secrets, which is git-ignored.",
+            ),
+            SettingNode::text(
+                "ai.model.max_tokens",
+                "Max tokens",
+                &get("ai.model.max_tokens", "2048"),
+                "Longest answer the model may produce.",
+            ),
+            SettingNode::text(
+                "ai.model.temperature",
+                "Temperature",
+                &get("ai.model.temperature", "0.3"),
+                "0 is deterministic, 1 is adventurous.",
             ),
         ],
     )
@@ -238,6 +274,68 @@ pub fn tree(values: &BTreeMap<String, String>) -> Vec<SettingNode> {
         ],
     );
 
+    // The tool list is fixed by KLEAN; the settings only decide which the model
+    // may call. Each row is a switch, and the help line says what it does.
+    let tools_group = SettingNode::group(
+        "ai.tools",
+        "Tools",
+        "What the model may do besides writing text. These are KLEAN's own MCP tools.",
+        vec![
+            SettingNode::boolean(
+                "ai.tools.view_ast",
+                "view_ast",
+                tool_enabled("view_ast"),
+                "Let the model read the project's AST tree to find nodes.",
+            ),
+            SettingNode::boolean(
+                "ai.tools.expand",
+                "expand",
+                tool_enabled("expand"),
+                "Let the model pull more nodes into the context, by fully qualified name.",
+            ),
+            SettingNode::boolean(
+                "ai.tools.diagram",
+                "diagram",
+                tool_enabled("diagram"),
+                "Let the model show a mermaid diagram to the user.",
+            ),
+            SettingNode::boolean(
+                "ai.tools.lean_check",
+                "lean_check",
+                tool_enabled("lean_check"),
+                "Let the model ask Lean for the type of an expression, with the whole project in scope.",
+            ),
+            SettingNode::boolean(
+                "ai.tools.ask",
+                "ask",
+                tool_enabled("ask"),
+                "Let the model ask a question with single-choice answers.",
+            ),
+            SettingNode::boolean(
+                "ai.tools.ask_multi",
+                "ask_multi",
+                tool_enabled("ask_multi"),
+                "Let the model ask a question with multiple-choice answers.",
+            ),
+        ],
+    )
+    .gated_by(AI_ENABLED);
+
+    // A place for the user's own words: whatever is written here is appended to
+    // KLEAN's built-in system prompt for every session.
+    let customize = SettingNode::group(
+        "ai.customize",
+        "Customize",
+        "Your own instructions, on top of the ones KLEAN gives the model.",
+        vec![SettingNode::text_area(
+            "ai.customize.system_prompt",
+            "System Prompt",
+            &get("ai.customize.system_prompt", ""),
+            "Appended to KLEAN's built-in system prompt, for every session. Leave it empty to send only the built-in one.",
+        )],
+    )
+    .gated_by(AI_ENABLED);
+
     let sandbox = SettingNode::group(
         "ai.sandbox",
         "Sandbox",
@@ -260,6 +358,8 @@ pub fn tree(values: &BTreeMap<String, String>) -> Vec<SettingNode> {
                     "Turns every option below on.",
                 ),
                 model,
+                tools_group,
+                customize,
                 sandbox,
             ],
         ),
@@ -273,7 +373,7 @@ pub fn defaults() -> Vec<(&'static str, String)> {
 
 /// True when `id` names a known setting (groups included).
 pub fn is_known(id: &str) -> bool {
-    matches!(id, "lean" | "ai" | "ai.model" | "ai.sandbox")
+    matches!(id, "lean" | "ai" | "ai.model" | "ai.tools" | "ai.sandbox")
         || matches!(
             id,
             toolchain::SETTING_ENABLED
@@ -288,7 +388,18 @@ pub fn is_known(id: &str) -> bool {
         )
         || matches!(
             id,
-            AI_ENABLED | "ai.model.type" | "ai.model.url" | "ai.model.api_key"
+            AI_ENABLED
+                | "ai.model.type"
+                | "ai.model.name"
+                | "ai.model.url"
+                | "ai.model.api_key"
+                | "ai.model.max_tokens"
+                | "ai.model.temperature"
+                | "ai.tools.view_ast"
+                | "ai.tools.expand"
+                | "ai.tools.diagram"
+                | "ai.tools.ask"
+                | "ai.tools.ask_multi"
         )
 }
 
@@ -332,4 +443,38 @@ pub fn ensure_secrets_ignored(fs: &ProjectFs) -> LeanResult<()> {
     next.push_str(SECRETS_FILE);
     next.push('\n');
     fs.write(".gitignore", &next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Settings → AI → Customize` exists, is hidden until AI is on, and its one
+    /// value is a prompt written over several lines.
+    #[test]
+    fn the_ai_group_offers_a_custom_system_prompt() {
+        let mut values = BTreeMap::new();
+        values.insert(AI_ENABLED.to_string(), "true".to_string());
+        values.insert(
+            "ai.customize.system_prompt".to_string(),
+            "Answer in French.\nBe brief.".to_string(),
+        );
+        let tree = tree(&values);
+        let ai = tree.iter().find(|node| node.id == "ai").expect("ai group");
+        let customize = ai
+            .children
+            .iter()
+            .find(|node| node.id == "ai.customize")
+            .expect("customize group");
+        assert_eq!(customize.label, "Customize");
+        assert_eq!(customize.depends_on.as_deref(), Some(AI_ENABLED));
+        let prompt = customize
+            .children
+            .iter()
+            .find(|node| node.id == "ai.customize.system_prompt")
+            .expect("system prompt");
+        assert_eq!(prompt.label, "System Prompt");
+        assert!(prompt.multiline, "a prompt needs a text area");
+        assert_eq!(prompt.value, "Answer in French.\nBe brief.");
+    }
 }

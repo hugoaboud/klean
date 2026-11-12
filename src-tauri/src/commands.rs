@@ -1,17 +1,19 @@
 //! Tauri commands: the only surface the Vue front-end talks to.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use tauri::{Emitter, Manager, State};
 
 use crate::lean::layout::Camera;
+use crate::ai::AiRuntime;
 use crate::lean::build::BuildState;
 use crate::lean::lsp::Goals;
+use crate::lean::scan::{Scan, ScanState};
 use crate::lean::{
-    FixedNode, LeanStatus, LogicGraph, NodeDetail, Project, ProjectGraph, RecentProject, Recents,
-    SettingNode, UpdateResult, WorkspaceView,
+    FixedNode, LeanStatus, LogicGraph, NodeDetail, PreviewResult, Project, ProjectGraph,
+    RecentProject, Recents, SettingNode, UpdateResult, WorkspaceView,
 };
 
 /// Holds the currently open project and the recently opened list. One workspace
@@ -19,10 +21,26 @@ use crate::lean::{
 /// serialised in Rust.
 #[derive(Default)]
 pub struct AppState {
-    project: Mutex<Option<Project>>,
+    /// Shared with the AI runtime, which reads the project from its worker threads.
+    project: Arc<Mutex<Option<Project>>>,
     recents: Mutex<Recents>,
     /// Where KLEAN keeps its own files: the elan it installs, the syntax bridge.
     app_data: Mutex<Option<PathBuf>>,
+    /// AI sessions and the model they talk to; built on first use.
+    ai: std::sync::OnceLock<Arc<AiRuntime>>,
+    /// The background read of the open project, if one was started.
+    scan: Mutex<Option<Scan>>,
+    /// Which open the scan belongs to: bumping it stops an older scan.
+    generation: Arc<Mutex<u64>>,
+}
+
+impl AppState {
+    /// The AI runtime, with the project handle it needs to build context.
+    fn ai(&self) -> Arc<AiRuntime> {
+        self.ai
+            .get_or_init(|| Arc::new(AiRuntime::new(Arc::clone(&self.project))))
+            .clone()
+    }
 }
 
 fn message(err: impl std::fmt::Display) -> String {
@@ -46,6 +64,36 @@ impl AppState {
         if let Ok(mut slot) = self.app_data.lock() {
             *slot = Some(directory);
         }
+    }
+
+    /// Stops whatever scan is running and returns the generation it belonged to.
+    fn next_generation(&self) -> u64 {
+        let mut generation = match self.generation.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *generation += 1;
+        if let Ok(mut scan) = self.scan.lock() {
+            if let Some(scan) = scan.take() {
+                scan.cancel();
+            }
+        }
+        *generation
+    }
+
+    /// Starts reading the open project in the background.
+    fn start_scan(&self) -> ScanState {
+        let generation = self.next_generation();
+        let scan = crate::lean::scan::start(
+            Arc::clone(&self.project),
+            generation,
+            Arc::clone(&self.generation),
+        );
+        let state = scan.state();
+        if let Ok(mut slot) = self.scan.lock() {
+            *slot = Some(scan);
+        }
+        state
     }
 
     fn data_dir(&self) -> Result<PathBuf, String> {
@@ -113,7 +161,11 @@ pub fn open_project(
 ) -> Result<WorkspaceView, String> {
     let mut project = Project::open(&path, state.data_dir()?).map_err(message)?;
     attach_build_console(&app, &mut project);
-    let view = view_of(&mut project)?;
+    // Nothing is parsed here: the board opens from the file listing, and the
+    // files are read afterwards by the scan job.
+    let view = project.view_listing().map_err(message)?;
+    state.next_generation();
+    configure_ai(&state, &project);
     *state.project.lock().map_err(message)? = Some(project);
     state.remember_path(&path, "folder");
     Ok(view)
@@ -132,7 +184,9 @@ pub fn open_project_zip(
         .unwrap_or_else(|| "archive".to_string());
     let mut project = Project::from_zip(&bytes, label, state.data_dir()?).map_err(message)?;
     attach_build_console(&app, &mut project);
+    state.next_generation();
     let view = view_of(&mut project)?;
+    configure_ai(&state, &project);
     *state.project.lock().map_err(message)? = Some(project);
     state.remember_path(&path, "zip");
     Ok(view)
@@ -156,7 +210,9 @@ pub fn import_project_zip(
     )
     .map_err(message)?;
     attach_build_console(&app, &mut project);
+    state.next_generation();
     let view = view_of(&mut project)?;
+    configure_ai(&state, &project);
     *state.project.lock().map_err(message)? = Some(project);
     Ok(view)
 }
@@ -172,6 +228,7 @@ pub fn new_memory_project(
         state.data_dir()?,
     )
     .map_err(message)?;
+    state.next_generation();
     let view = view_of(&mut project)?;
     *state.project.lock().map_err(message)? = Some(project);
     Ok(view)
@@ -179,13 +236,62 @@ pub fn new_memory_project(
 
 #[tauri::command(async)]
 pub fn close_project(state: State<'_, AppState>) -> Result<(), String> {
+    state.next_generation();
     *state.project.lock().map_err(message)? = None;
     Ok(())
 }
 
+/// The project as it stands: read files show their declarations, files the scan has
+/// not reached yet show as files.
 #[tauri::command(async)]
 pub fn workspace_view(state: State<'_, AppState>) -> Result<WorkspaceView, String> {
-    with_project(&state, view_of)
+    with_project(&state, |project| {
+        if project.is_read() {
+            project.view().map_err(message)
+        } else {
+            project.view_listing().map_err(message)
+        }
+    })
+}
+
+// ---------------------------------------------------------------------- scan
+
+/// Reads the open project's files in the background, for the console to follow.
+///
+/// Nothing is started when Lean cannot read the files at all: the console says why
+/// instead of printing the same failure once per file.
+#[tauri::command]
+pub fn scan_project(state: State<'_, AppState>) -> Result<ScanState, String> {
+    {
+        let guard = state.project.lock().map_err(message)?;
+        let project = guard
+            .as_ref()
+            .ok_or_else(|| "no project is open".to_string())?;
+        if let Some(reason) = project.scan_blocked() {
+            return Ok(ScanState {
+                running: false,
+                summary: Some(reason),
+                ..Default::default()
+            });
+        }
+    }
+    Ok(state.start_scan())
+}
+
+/// How the background read stands.
+#[tauri::command]
+pub fn scan_state(state: State<'_, AppState>) -> Result<ScanState, String> {
+    let guard = state.scan.lock().map_err(message)?;
+    Ok(guard.as_ref().map(Scan::state).unwrap_or_default())
+}
+
+/// Stops the background read; the files read so far stay in the cache.
+#[tauri::command]
+pub fn scan_cancel(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(scan) = state.scan.lock().map_err(message)?.as_ref() {
+        scan.cancel();
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------- graph
@@ -228,6 +334,23 @@ pub fn update_node(
     with_project(&state, |project| project.update(&id, &text).map_err(message))
 }
 
+/// Checks an edited node **without writing it**: the text goes to Lean at once, so
+/// diagnostics arrive while the user is still typing.
+#[tauri::command(async)]
+pub fn preview_node(
+    state: State<'_, AppState>,
+    id: String,
+    text: String,
+) -> Result<PreviewResult, String> {
+    with_project(&state, |project| project.preview(&id, &text).map_err(message))
+}
+
+/// Throws an unsaved edit away and re-checks the file as it is on disk.
+#[tauri::command(async)]
+pub fn discard_draft(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    with_project(&state, |project| project.discard_draft(&id).map_err(message))
+}
+
 /// The settings tree, with the project's values applied.
 /// Remembers where a link's middle segment was dragged to.
 #[tauri::command(async)]
@@ -255,11 +378,19 @@ pub fn save_settings(
     state: State<'_, AppState>,
     values: Vec<(String, String)>,
 ) -> Result<Vec<SettingNode>, String> {
-    with_project(&state, |project| {
+    let tree = with_project(&state, |project| {
         let tree = project.save_settings(&values).map_err(message)?;
         project.reconfigure_lean();
         Ok(tree)
-    })
+    })?;
+    // The AI runtime reads the same settings tree; apply them now so a new key and
+    // a new model take effect without reopening the project.
+    let mut map = std::collections::BTreeMap::new();
+    for value in &values {
+        map.insert(value.0.clone(), value.1.clone());
+    }
+    state.ai().configure(&map);
+    Ok(tree)
 }
 
 // --------------------------------------------------------------------- lean
@@ -638,6 +769,23 @@ pub async fn lean_install(app: tauri::AppHandle) -> Result<String, String> {
     })
 }
 
+/// The settings tree flattened to the map the AI runtime reads.
+fn flatten_settings(tree: &[SettingNode], out: &mut std::collections::BTreeMap<String, String>) {
+    for node in tree {
+        if node.kind != crate::lean::settings::SettingKind::Group {
+            out.insert(node.id.clone(), node.value.clone());
+        }
+        flatten_settings(&node.children, out);
+    }
+}
+
+/// Applies the project's AI settings to the runtime, after opening or reloading it.
+fn configure_ai(state: &State<'_, AppState>, project: &Project) {
+    let mut values = std::collections::BTreeMap::new();
+    flatten_settings(&project.settings_tree(), &mut values);
+    state.ai().configure(&values);
+}
+
 /// Value of one leaf of the settings tree, by id.
 fn find_setting(tree: &[SettingNode], id: &str) -> Option<String> {
     for node in tree {
@@ -649,4 +797,69 @@ fn find_setting(tree: &[SettingNode], id: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ----------------------------------------------------------------------- ai
+
+/// Every AI session, newest last: the tabs of the AI modal.
+#[tauri::command(async)]
+pub fn ai_sessions(state: State<'_, AppState>) -> Result<Vec<klean_ai::Session>, String> {
+    Ok(state.ai().sessions())
+}
+
+/// Opens a session seeded with nodes, and returns its id.
+#[tauri::command(async)]
+pub fn ai_open(
+    state: State<'_, AppState>,
+    origin: String,
+    title: String,
+    nodes: Vec<String>,
+) -> Result<String, String> {
+    state.ai().open(&origin, &title, nodes)
+}
+
+/// Sends a prompt: KLEAN's context first, then the words.
+#[tauri::command(async)]
+pub fn ai_prompt(
+    state: State<'_, AppState>,
+    session: String,
+    text: String,
+) -> Result<(), String> {
+    state.ai().prompt(&session, &text)
+}
+
+/// Answers an `ask`/`ask_multi` tool call.
+#[tauri::command(async)]
+pub fn ai_answer(
+    state: State<'_, AppState>,
+    session: String,
+    entry: String,
+    answer: String,
+) -> Result<(), String> {
+    state.ai().answer(&session, &entry, &answer)
+}
+
+/// The board's verdict on a `diagram` tool call: `error` is mermaid's complaint when
+/// it could not draw, `null` when it drew.
+#[tauri::command(async)]
+pub fn ai_diagram(
+    state: State<'_, AppState>,
+    session: String,
+    entry: String,
+    error: Option<String>,
+) -> Result<(), String> {
+    state.ai().diagram(&session, &entry, error)
+}
+
+/// Closes a session, discarding its feed.
+#[tauri::command(async)]
+pub fn ai_close(state: State<'_, AppState>, session: String) -> Result<(), String> {
+    state.ai().close(&session);
+    Ok(())
+}
+
+/// Whether AI is switched on and configured, for the header button.
+#[tauri::command(async)]
+pub fn ai_ready(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.ai().ready())
 }

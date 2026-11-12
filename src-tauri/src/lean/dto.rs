@@ -72,6 +72,10 @@ pub struct WorkspaceView {
     pub root: Option<String>,
     pub tree: Vec<TreeNode>,
     pub stats: Stats,
+    /// True when the files have not been read yet: the tree is a file listing,
+    /// and the background scan fills in the declarations.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -136,6 +140,22 @@ pub struct UpdateResult {
     pub ok: bool,
     /// True while the language server is still checking: the diagnostics above
     /// are the previous ones, and the UI should ask again shortly.
+    pub processing: bool,
+}
+
+/// The answer to a keystroke: the node as it now reads, and what Lean says about it.
+///
+/// Nothing here touches the disk. The board's tree is not in it either — a preview
+/// is about one declaration — which is what keeps typing cheap.
+#[derive(Debug, Clone, Serialize)]
+pub struct PreviewResult {
+    pub id: String,
+    pub detail: NodeDetail,
+    pub diagnostics: Vec<DiagnosticDto>,
+    /// True when Lean reported no errors for the edited file.
+    pub ok: bool,
+    /// True while the language server is still checking: the diagnostics above are
+    /// the previous ones, and the UI should ask again shortly.
     pub processing: bool,
 }
 

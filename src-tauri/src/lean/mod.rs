@@ -21,6 +21,7 @@
 
 pub mod ast;
 pub mod build;
+pub mod check;
 pub mod dto;
 pub mod engine;
 pub mod error;
@@ -31,6 +32,7 @@ pub mod lsp;
 pub mod printer;
 pub mod project;
 pub mod recents;
+pub mod scan;
 pub mod settings;
 pub mod toolchain;
 
@@ -41,7 +43,7 @@ pub use toolchain::Toolchain;
 
 pub use dto::{
     FixedNode, GraphExternal, GraphLayer, GraphLink, GraphNode, LogicGraph, NodeDetail,
-    ProjectGraph, RecentProject, TheoryRef, UpdateResult, WorkspaceView,
+    PreviewResult, ProjectGraph, RecentProject, TheoryRef, UpdateResult, WorkspaceView,
 };
 pub use error::{LeanError, LeanResult};
 pub use project::Project;

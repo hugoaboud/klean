@@ -1,3 +1,4 @@
+mod ai;
 mod commands;
 pub mod lean;
 
@@ -36,11 +37,16 @@ pub fn run() {
             commands::new_memory_project,
             commands::close_project,
             commands::workspace_view,
+            commands::scan_project,
+            commands::scan_state,
+            commands::scan_cancel,
             commands::graph_view,
             commands::toggle_graph_node,
             commands::focus_graph_node,
             commands::node_detail,
             commands::update_node,
+            commands::preview_node,
+            commands::discard_draft,
             commands::rename_node,
             commands::update_comments,
             commands::save_positions,
@@ -76,6 +82,13 @@ pub fn run() {
             commands::lean_goals,
             commands::lean_hover,
             commands::lean_install,
+            commands::ai_sessions,
+            commands::ai_open,
+            commands::ai_prompt,
+            commands::ai_answer,
+            commands::ai_diagram,
+            commands::ai_close,
+            commands::ai_ready,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

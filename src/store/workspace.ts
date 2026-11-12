@@ -55,6 +55,10 @@ interface State {
   build: api.BuildState | null;
   /** True while the build console is open. */
   buildOpen: boolean;
+  /** True when the editor holds text Lean has checked but the disk has not seen. */
+  editorDirty: boolean;
+  /** How the background read of the project stands (null before one starts). */
+  scan: api.ScanState | null;
   /** True while Lean is still processing at least one file. */
   processing: boolean;
   /** Files being processed, for the modal's indicator. */
@@ -91,6 +95,8 @@ export const state = reactive<State>({
   install: null,
   build: null,
   buildOpen: false,
+  editorDirty: false,
+  scan: null,
   processing: false,
   processingFiles: [],
 });
@@ -137,8 +143,11 @@ function adopt(view: api.WorkspaceView) {
   state.goals = null;
   state.processing = false;
   state.processingFiles = [];
-  // Opening a project reads settings and the toolchain status — nothing more.
-  // Parsing, checking and building are the user's call from here on.
+  state.scan = null;
+  // The board is on screen already (a folder project opens from its file listing).
+  // What is left — reading the files — happens in the background, where the console
+  // can show it; checking and building stay the user's call.
+  if (view.pending) void startScan();
   void (async () => {
     await loadSettings();
     await loadLean();
@@ -147,6 +156,7 @@ function adopt(view: api.WorkspaceView) {
 }
 
 async function loadGraph() {
+  await waitForScan();
   const graph = await run("graph", () => api.graphView());
   if (graph) state.graph = graph;
 }
@@ -170,6 +180,79 @@ export function canBuild(): boolean {
 export function buildPrompt(): "ask" | "always" | "never" {
   const value = settingValue("lean.build.prompt", "ask");
   return value === "always" || value === "never" ? value : "ask";
+}
+
+let scanTimer: number | null = null;
+/** Set when the user stops the read: its end must not reload the boards. */
+let scanStopped = false;
+
+/**
+ * Reads the open project's files in the background.
+ *
+ * Opening a project shows the file listing at once; the declarations arrive
+ * afterwards. While that runs, the console reports it file by file, and the board
+ * is refreshed as soon as it is done.
+ */
+async function startScan() {
+  if (scanTimer !== null) {
+    window.clearTimeout(scanTimer);
+    scanTimer = null;
+  }
+  scanStopped = false;
+  const scan = await api.leanScan().catch(() => null);
+  if (!scan) return;
+  state.scan = scan;
+  watchScan();
+}
+
+/** Polls the scan, and reloads the board once the files are read. */
+function watchScan() {
+  if (scanTimer !== null) return;
+  const tick = async () => {
+    const scan = await api.leanScanState().catch(() => null);
+    if (!scan) {
+      scanTimer = null;
+      return;
+    }
+    state.scan = scan;
+    if (scan.running) {
+      scanTimer = window.setTimeout(tick, 300);
+      return;
+    }
+    scanTimer = null;
+    // Stopped by the user: the boards keep what they have rather than pulling in
+    // the files that were just refused.
+    if (scanStopped) return;
+    await refreshAfterScan();
+  };
+  scanTimer = window.setTimeout(tick, 300);
+}
+
+/** Fills the tree in once the read is over. */
+async function refreshAfterScan() {
+  const view = await api.workspaceView().catch(() => null);
+  if (view) state.view = view;
+  await reloadBoards();
+  const id = state.detail?.id;
+  if (id && state.editorOpen) {
+    const detail = await api.nodeDetail(id).catch(() => null);
+    if (detail) state.detail = detail;
+  }
+}
+
+/**
+ * Waits for the background read, for the boards that need the files: the graph
+ * and the logic tree are built from declarations, not from file names.
+ */
+async function waitForScan(): Promise<void> {
+  const deadline = Date.now() + 120000;
+  while (state.scan?.running && Date.now() < deadline) {
+    // Asked of Rust, not of the poller: the boards must not depend on it.
+    const scan = await api.leanScanState().catch(() => null);
+    if (!scan || !scan.running) return;
+    state.scan = scan;
+    await new Promise((resolve) => window.setTimeout(resolve, 200));
+  }
 }
 
 /** Reads the build console from Rust (cheap: it is a snapshot). */
@@ -210,9 +293,16 @@ async function pollProcessing() {
     }
     pollTimer = null;
     // Lean settled: pick up the diagnostics it published.
-    const view = await api.workspaceView().catch(() => null);
-    if (view) state.view = view;
-    await reloadBoards();
+    //
+    // While the editor holds an unsaved edit, only the node is refreshed: walking
+    // the whole project for the boards after every keystroke is what made checking
+    // feel slow, and the boards are about saved work anyway.
+    const editing = state.editorOpen && state.editorDirty;
+    if (!editing) {
+      const view = await api.workspaceView().catch(() => null);
+      if (view) state.view = view;
+      await reloadBoards();
+    }
     const id = state.detail?.id;
     if (id && state.editorOpen) {
       const detail = await api.nodeDetail(id).catch(() => null);
@@ -339,6 +429,7 @@ function mergePositions(
  * and the logic view can never disagree after an edit.
  */
 async function reloadBoards() {
+  await waitForScan();
   const [graph, logic] = await Promise.all([
     api.graphView(),
     api.logicGraph(state.openTheory || null),
@@ -434,12 +525,16 @@ export const actions = {
       const view = await api.workspaceView();
       state.view = view;
       state.page = "project";
-      await loadGraph();
-      await loadSettings();
-      await loadLean();
+      // A project given on the command line opens the same way as any other: the
+      // listing first, the files in the background.
+      if (view.pending) void startScan();
+      // Settings and Lean's status come from the project, not from its files, so
+      // they do not wait for the read; the boards do.
+      await Promise.all([loadSettings(), loadLean()]);
       void pollBuild();
       // A board that starts on the logic view needs its graph loaded too.
-      if (state.boardView === "logic") await loadLogic();
+      if (state.boardView === "logic") void loadLogic();
+      void loadGraph();
     } catch {
       state.page = "welcome";
     }
@@ -454,7 +549,10 @@ export const actions = {
     const view = await run("open", () => api.openProject(path));
     if (!view) return;
     adopt(view);
-    await Promise.all([loadGraph(), loadRecents()]);
+    await loadRecents();
+    // A folder project fills itself in from the background read; an archive or an
+    // in-memory workspace is complete the moment it opens.
+    if (!view.pending) await loadGraph();
   },
 
   async openZip(path: string) {
@@ -625,6 +723,14 @@ export const actions = {
       .saveSettings([["lean.build.prompt", value]])
       .catch(() => null);
     if (tree) state.settings = tree;
+  },
+
+  /** Stops the background read; what was read stays. */
+  async cancelScan() {
+    scanStopped = true;
+    await api.leanScanCancel().catch(() => undefined);
+    const scan = await api.leanScanState().catch(() => null);
+    if (scan) state.scan = scan;
   },
 
   /** Stops a running build. */
@@ -851,6 +957,43 @@ export const actions = {
     if (graph) state.graph = graph;
   },
 
+  /**
+   * Checks the editor's text without saving it.
+   *
+   * The text goes to Rust, which splices it into the file in memory and hands it to
+   * Lean straight away; the answers (diagnostics, processing) come back as the
+   * detail the editor already shows. Nothing is written to disk.
+   */
+  async previewText(text: string) {
+    const id = state.detail?.id;
+    if (!id) return;
+    state.saveError = null;
+    try {
+      const result = await api.previewNode(id, text);
+      // Only the node: the board's tree is about saved work, and rebuilding it on
+      // every keystroke is exactly what made checking feel slow.
+      state.detail = result.detail;
+      // The server publishes a moment later: follow it, so the diagnostics under
+      // the caret are Lean's, not the previous ones.
+      void pollProcessing();
+    } catch (error) {
+      state.saveError = error instanceof Error ? error.message : String(error);
+    }
+  },
+
+  /** Throws the unsaved edit away and re-checks what is on disk. */
+  async discardDraft() {
+    const id = state.detail?.id;
+    state.editorDirty = false;
+    if (!id) return;
+    try {
+      await api.discardDraft(id);
+      await loadDetail(id);
+    } catch (error) {
+      state.saveError = error instanceof Error ? error.message : String(error);
+    }
+  },
+
   async applyText(text: string) {
     const id = state.detail?.id;
     if (!id) return;
@@ -859,6 +1002,7 @@ export const actions = {
     try {
       const result = await api.updateNode(id, text);
       state.detail = result.detail;
+      state.editorDirty = false;
       if (state.view) {
         state.view.tree = result.tree;
         state.view.stats = result.stats;

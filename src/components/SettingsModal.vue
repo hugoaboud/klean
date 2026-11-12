@@ -217,6 +217,14 @@ function discard() {
                     {{ props.install ?? leaf.label }}
                   </UiButton>
 
+                  <textarea
+                    v-else-if="leaf.multiline"
+                    class="settings__input settings__input--area k-mono"
+                    rows="4"
+                    spellcheck="false"
+                    :value="leaf.value"
+                    @input="setValue(leaf, ($event.target as HTMLTextAreaElement).value)"
+                  />
                   <input
                     v-else
                     class="settings__input k-mono"
@@ -266,6 +274,14 @@ function discard() {
                   {{ props.install ?? child.label }}
                 </UiButton>
 
+                <textarea
+                  v-else-if="child.multiline"
+                  class="settings__input settings__input--area k-mono"
+                  rows="4"
+                  spellcheck="false"
+                  :value="child.value"
+                  @input="setValue(child, ($event.target as HTMLTextAreaElement).value)"
+                />
                 <input
                   v-else
                   class="settings__input k-mono"
@@ -431,6 +447,18 @@ function discard() {
   color: var(--text);
   font-family: var(--mono);
   font-size: var(--fs-xs);
+}
+
+/* A prompt is written over several lines: it gets the row's width and room to
+   breathe, instead of a one-line field. */
+.settings__input--area {
+  width: 100%;
+  min-height: 62px;
+  max-height: 160px;
+  padding: 5px 7px;
+  resize: vertical;
+  line-height: 1.5;
+  white-space: pre-wrap;
 }
 
 .settings__input:focus,

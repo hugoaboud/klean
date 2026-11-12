@@ -11,7 +11,7 @@ use super::ast::{
     is_import, AstNode, Diagnostic, LineIndex, ParsedFile, Severity, Span,
 };
 use super::dto::{
-    CameraDto, DiagnosticDto, GraphLink, GraphNode, LogicGraph, NodeDetail,
+    CameraDto, DiagnosticDto, GraphLink, GraphNode, LogicGraph, NodeDetail, PreviewResult,
     ProjectGraph, SettingNode, Stats, TreeNode, UpdateResult, WorkspaceView,
 };
 use super::engine::{Engine, LeanStatus, Parse};
@@ -111,6 +111,9 @@ pub struct Project {
     fs: ProjectFs,
     libs: Vec<Lib>,
     cache: HashMap<String, Arc<CachedFile>>,
+    /// Files the editor has changed but not saved: the text as typed, so Lean can
+    /// check it. Nothing here is on disk, and nothing here outlives the editor.
+    drafts: HashMap<String, Arc<CachedFile>>,
     /// Graph nodes the user has expanded. Rust owns this so the UI stays dumb.
     expanded: HashSet<String>,
     graph_seeded: bool,
@@ -164,6 +167,7 @@ impl Project {
             fs,
             libs,
             cache: HashMap::new(),
+            drafts: HashMap::new(),
             expanded: HashSet::new(),
             graph_seeded: false,
             layout,
@@ -221,10 +225,7 @@ impl Project {
         let (rel, default_line) = match self.resolve(id)? {
             Target::Ast { rel, path } => {
                 let cached = self.load(&rel, Parse::Exact)?;
-                let node = cached
-                    .parsed
-                    .get(&path)
-                    .ok_or_else(|| LeanError::msg(format!("node `{id}` no longer exists")))?;
+                let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
                 let line = cached.lines.line_of(node.inner.end);
                 (rel, line)
             }
@@ -248,10 +249,7 @@ impl Project {
         let (rel, default_line, default_char) = match self.resolve(id)? {
             Target::Ast { rel, path } => {
                 let cached = self.load(&rel, Parse::Tree)?;
-                let node = cached
-                    .parsed
-                    .get(&path)
-                    .ok_or_else(|| LeanError::msg(format!("node `{id}` no longer exists")))?;
+                let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
                 let line = cached.lines.line_of(node.inner.end);
                 (rel, line, 0)
             }
@@ -289,7 +287,50 @@ impl Project {
     /// `Exact` re-parses a tree that was only parsed for the board (core syntax),
     /// which is what happens the first time a file is opened in the editor.
     fn load(&mut self, rel: &str, mode: Parse) -> LeanResult<Arc<CachedFile>> {
+        // An unsaved edit is what the user means by "this file" right now: Lean has
+        // been given it, so the tree, the diagnostics and the goals all read it.
+        // The server's answer keeps arriving, so the cell is refreshed on the way out
+        // — exactly as it is for a file on disk.
+        if let Some(draft) = self.drafts.get(rel) {
+            if mode == Parse::Tree || draft.exact {
+                *draft
+                    .diagnostics
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    self.engine.diagnostics(rel);
+                return Ok(draft.clone());
+            }
+        }
+        self.load_disk(rel, mode)
+    }
+
+    /// The file as it is on disk, ignoring any unsaved edit.
+    fn load_disk(&mut self, rel: &str, mode: Parse) -> LeanResult<Arc<CachedFile>> {
         let source = self.fs.read(rel)?;
+        // While the background read is preparing Lean's parser, parsing would mean
+        // waiting on it for seconds. Say so instead, and parse on the next ask.
+        if crate::lean::scan::warming() {
+            return Ok(Arc::new(CachedFile {
+                rel: rel.to_string(),
+                hash: content_hash(&source),
+                lines: LineIndex::new(&source),
+                parsed: ParsedFile {
+                    nodes: Vec::new(),
+                    diagnostics: vec![Diagnostic {
+                        line: 1,
+                        end_line: 1,
+                        span: Span::EMPTY,
+                        severity: Severity::Info,
+                        message: "the project is still being read: this file's declarations are on their way"
+                            .to_string(),
+                    }],
+                    module_doc: None,
+                },
+                source,
+                diagnostics: std::sync::Mutex::new(Vec::new()),
+                exact: false,
+            }));
+        }
         let hash = content_hash(&source);
         if let Some(cached) = self.cache.get(rel) {
             if cached.hash == hash && (mode == Parse::Tree || cached.exact) {
@@ -381,6 +422,72 @@ impl Project {
         }
     }
 
+    /// Why the files cannot be read at all, if that is the case.
+    ///
+    /// Checked before the background scan starts, so an archive, an in-memory
+    /// workspace or a project without Lean is answered once instead of once per
+    /// file.
+    pub fn scan_blocked(&self) -> Option<String> {
+        let status = self.lean_status();
+        if !status.enabled {
+            return Some("Lean is switched off: the board shows file names only".to_string());
+        }
+        if status.backend != "folder" {
+            return Some("this workspace has no folder on disk to read".to_string());
+        }
+        if !status.available {
+            return Some(format!(
+                "no Lean toolchain yet ({}): the board shows file names only",
+                status.error.as_deref().unwrap_or("not found")
+            ));
+        }
+        None
+    }
+
+    /// True when every file the board shows has been read into the cache.
+    pub fn is_read(&self) -> bool {
+        self.scan_files()
+            .iter()
+            .all(|rel| self.cache.contains_key(rel))
+    }
+
+    /// Every file the board shows, in board order: the scan walks this.
+    pub fn scan_files(&self) -> Vec<String> {
+        self.libs
+            .iter()
+            .flat_map(|lib| lib_files(lib))
+            .map(|file| file.rel.clone())
+            .collect()
+    }
+
+    /// Reads one file into the cache. The scan calls this once per file, holding
+    /// the project lock only for as long as this takes.
+    pub fn scan_file(&mut self, rel: &str) -> LeanResult<usize> {
+        // The background read is about what is saved: a draft belongs to the editor.
+        let file = self.load_disk(rel, Parse::Tree)?;
+        Ok(file.parsed.node_count())
+    }
+
+    /// `lake env lean --stdin --json`, rooted at the project, for `lean_check`.
+    pub fn lake_env_lean(&self) -> LeanResult<std::process::Command> {
+        self.engine.lake_env_lean()
+    }
+
+    /// Where `lake build` puts this project's `.olean` files, when it has run.
+    pub fn built_module_dir(&self) -> Option<std::path::PathBuf> {
+        self.engine.built_module_dir()
+    }
+
+    /// How long one Lean operation may take.
+    pub fn lean_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.engine.timeout_seconds().max(10))
+    }
+
+    /// Where the parser would look for modules, for the scan to prepare it with.
+    pub fn parser_options(&self) -> LeanResult<klean_ast::Options> {
+        self.engine.parser_options()
+    }
+
     fn load_all(&mut self) -> LeanResult<HashMap<String, Arc<CachedFile>>> {
         let mut loaded = HashMap::new();
         let rels: Vec<String> = self
@@ -398,9 +505,27 @@ impl Project {
 
     // ------------------------------------------------------------------ view
 
+    /// The project as a file listing, with nothing parsed.
+    ///
+    /// This is what opening a project returns: the tree of libraries, folders and
+    /// files is known from the filesystem alone, so the board can be on screen in
+    /// milliseconds. Reading the files — the declarations, the diagnostics — is
+    /// [`crate::lean::scan`]'s job, in the background.
+    pub fn view_listing(&mut self) -> LeanResult<WorkspaceView> {
+        self.assemble(&HashMap::new(), true)
+    }
+
     /// Full project view: the AST item tree plus aggregate statistics.
     pub fn view(&mut self) -> LeanResult<WorkspaceView> {
         let loaded = self.load_all()?;
+        self.assemble(&loaded, false)
+    }
+
+    fn assemble(
+        &mut self,
+        loaded: &HashMap<String, Arc<CachedFile>>,
+        pending: bool,
+    ) -> LeanResult<WorkspaceView> {
         let libs = self.libs.clone();
         let mut stats = Stats {
             libs: libs.len(),
@@ -408,7 +533,7 @@ impl Project {
         };
         let mut tree = Vec::new();
         for lib in &libs {
-            let (node, files, nodes) = self.lib_node(lib, &loaded);
+            let (node, files, nodes) = self.lib_node(lib, loaded);
             stats.files += files;
             stats.nodes += nodes;
             tree.push(node);
@@ -422,6 +547,7 @@ impl Project {
                 .map(|path| path.display().to_string()),
             tree,
             stats,
+            pending,
         })
     }
 
@@ -535,7 +661,8 @@ impl Project {
                     format!("{issues} issue{}", plural(issues))
                 }
             }
-            None => "unreadable".to_string(),
+            // Not in the cache: the background scan has not reached this file yet.
+            None => "not parsed yet".to_string(),
         };
         let status = cached.and_then(|_| worst_status(&children));
         (
@@ -914,10 +1041,7 @@ impl Project {
             Target::Ast { rel, path } => {
                 let cached = self.load(&rel, Parse::Exact)?;
 
-                let node = cached
-                    .parsed
-                    .get(&path)
-                    .ok_or_else(|| LeanError::msg(format!("node `{id}` no longer exists")))?;
+                let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
                 let start_line = cached.lines.line_of(node.inner.start);
                 let start_column = utf16_column(&cached.source, cached.lines.start_of(start_line), node.inner.start);
                 let end_line = cached.lines.line_of(node.inner.end);
@@ -1019,10 +1143,7 @@ impl Project {
             Target::Ast { rel, path } => {
                 let cached = self.load(&rel, Parse::Exact)?;
 
-                let node = cached
-                    .parsed
-                    .get(&path)
-                    .ok_or_else(|| LeanError::msg(format!("node `{id}` no longer exists")))?;
+                let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
                 (rel, Some(node.inner))
             }
             Target::File(rel) | Target::AstGroup(rel) => (rel, None),
@@ -1032,14 +1153,134 @@ impl Project {
                 ));
             }
         };
-        let source = self.fs.read(&rel)?;
+        // The base is what is on screen: an unsaved edit is part of what is being
+        // saved, and splicing into the disk copy would throw it away.
+        let source = self.source_of(&rel)?;
         let next = match span {
             Some(span) => splice(&source, span, text)?,
             None => text.to_string(),
         };
         self.fs.write(&rel, &next)?;
+        self.drafts.remove(&rel);
         self.cache.remove(&rel);
         self.finish_edit(id, &rel)
+    }
+
+    /// Checks an edited declaration **without writing anything**.
+    ///
+    /// The text is spliced into the file as it stands (the draft, if there is one),
+    /// parsed, and handed to the language server straight away — which is what makes
+    /// typing feel immediate: Lean sees the change before the disk does. The answer
+    /// carries this node's detail and diagnostics only; the board's tree is left for
+    /// [`Project::update`], so a keystroke does not re-read the project.
+    pub fn preview(&mut self, id: &str, text: &str) -> LeanResult<PreviewResult> {
+        let (rel, span) = match self.resolve(id)? {
+            Target::Ast { rel, path } => {
+                let cached = self.load(&rel, Parse::Exact)?;
+                let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
+                (rel, Some(node.inner))
+            }
+            Target::File(rel) | Target::AstGroup(rel) => (rel, None),
+            _ => return Err(LeanError::msg("only file and declaration nodes can be edited")),
+        };
+        let base = self.source_of(&rel)?;
+        let next = match span {
+            Some(span) => splice(&base, span, text)?,
+            None => text.to_string(),
+        };
+        self.hold_draft(&rel, next);
+        let detail = match self.detail(id) {
+            Ok(detail) => detail,
+            Err(_) => self.detail(&format!("file:{rel}"))?,
+        };
+        let diagnostics = self
+            .drafts
+            .get(&rel)
+            .map(|draft| draft.diagnostics())
+            .unwrap_or_default();
+        Ok(PreviewResult {
+            id: detail.id.clone(),
+            ok: !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == Severity::Error),
+            diagnostics: diagnostics_of(&diagnostics),
+            processing: self.engine.processing(),
+            detail,
+        })
+    }
+
+    /// Throws the unsaved edit away and puts the saved file back in front of Lean.
+    pub fn discard_draft(&mut self, id: &str) -> LeanResult<()> {
+        let rel = match self.resolve(id)? {
+            Target::Ast { rel, .. } | Target::File(rel) | Target::AstGroup(rel) => rel,
+            _ => return Err(LeanError::msg("only file and declaration nodes can be edited")),
+        };
+        if self.drafts.remove(&rel).is_none() {
+            return Ok(());
+        }
+        // The server is holding the draft: give it the saved text again, so what it
+        // reports is about what is on disk.
+        let saved = self.fs.read(&rel)?;
+        self.engine.sync(&rel, &saved);
+        if let Some(cached) = self.cache.get(&rel) {
+            *cached
+                .diagnostics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.engine.diagnostics(&rel);
+        }
+        Ok(())
+    }
+
+    /// True when this node's file holds an unsaved edit.
+    pub fn has_draft(&self, id: &str) -> bool {
+        let rel = match self.resolve(id) {
+            Ok(Target::Ast { rel, .. } | Target::File(rel) | Target::AstGroup(rel)) => rel,
+            _ => return false,
+        };
+        self.drafts.contains_key(&rel)
+    }
+
+    /// The source an edit starts from: the unsaved text if there is one, the file
+    /// otherwise. A second keystroke must build on the first, not on the disk.
+    fn source_of(&mut self, rel: &str) -> LeanResult<String> {
+        match self.drafts.get(rel) {
+            Some(draft) => Ok(draft.source.clone()),
+            None => self.fs.read(rel),
+        }
+    }
+
+    /// Parses the edited text and gives it to the language server, holding it as the
+    /// draft for this file until it is saved or thrown away.
+    fn hold_draft(&mut self, rel: &str, source: String) {
+        // One draft at a time: the editor edits one node, and a draft left behind on
+        // another file would quietly become that file's content for the board.
+        let stale: Vec<String> = self
+            .drafts
+            .keys()
+            .filter(|held| *held != rel)
+            .cloned()
+            .collect();
+        for held in stale {
+            self.drafts.remove(&held);
+            if let Ok(saved) = self.fs.read(&held) {
+                self.engine.sync(&held, &saved);
+            }
+        }
+        let parsed = self.parse_with_lean(rel, &source, Parse::Exact);
+        let draft = Arc::new(CachedFile {
+            rel: rel.to_string(),
+            hash: content_hash(&source),
+            lines: LineIndex::new(&source),
+            source,
+            parsed,
+            // Whatever the server last said, which its next answer will replace.
+            diagnostics: std::sync::Mutex::new(self.engine.diagnostics(rel)),
+            exact: true,
+        });
+        // Straight to Lean: the whole point is that checking does not wait for a
+        // write, and the diagnostics come back while the user is still typing.
+        self.engine.sync(rel, &draft.source);
+        self.drafts.insert(rel.to_string(), draft);
     }
 
     /// Rewrites the plain (`--`) comments sitting above a node.
@@ -1048,10 +1289,7 @@ impl Project {
             Target::Ast { rel, path } => {
                 let cached = self.load(&rel, Parse::Exact)?;
 
-                let node = cached
-                    .parsed
-                    .get(&path)
-                    .ok_or_else(|| LeanError::msg(format!("node `{id}` no longer exists")))?;
+                let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
                 let line_start = line_start_of(&cached.source, node.span.start);
                 let indent = indent_of(&cached.source, node.span.start);
                 (
@@ -1066,7 +1304,9 @@ impl Project {
         };
         let _ = comment_span;
 
-        let source = self.fs.read(&rel)?;
+        // The spans come from the file as the editor has it, so the text they are
+        // spliced into must be the same text — the draft, when there is one.
+        let source = self.source_of(&rel)?;
         // Notes are written as `--` lines, one per line, wrapped so that no line
         // runs past the width a comment stays readable at. Markers pasted in are
         // stripped first, since the editor edits plain text.
@@ -1094,6 +1334,7 @@ impl Project {
             &source[node_start as usize..]
         );
         self.fs.write(&rel, &next)?;
+        self.drafts.remove(&rel);
         self.cache.remove(&rel);
         self.finish_edit(id, &rel)
     }
@@ -1110,10 +1351,7 @@ impl Project {
         let (rel, span) = match self.resolve(id)? {
             Target::Ast { rel, path } => {
                 let cached = self.load(&rel, Parse::Tree)?;
-                let node = cached
-                    .parsed
-                    .get(&path)
-                    .ok_or_else(|| LeanError::msg(format!("node `{id}` no longer exists")))?;
+                let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
                 let span = node
                     .name_span
                     .ok_or_else(|| LeanError::msg("this node has no declared name"))?;
@@ -1121,9 +1359,10 @@ impl Project {
             }
             _ => return Err(LeanError::msg("this node cannot be renamed")),
         };
-        let source = self.fs.read(&rel)?;
+        let source = self.source_of(&rel)?;
         let next = splice(&source, span, trimmed)?;
         self.fs.write(&rel, &next)?;
+        self.drafts.remove(&rel);
         self.cache.remove(&rel);
         self.finish_edit(id, &rel)
     }
@@ -1261,6 +1500,228 @@ impl Project {
         Ok(printer::print_file(&rel, &cached.source, &cached.parsed))
     }
 
+    // ------------------------------------------------------------------- ai
+
+    /// The Lean source an AI request needs: the named nodes, everything they
+    /// depend on, and the imports that make the result a compilable file.
+    ///
+    /// Declarations keep the namespaces they live in, so a name that resolves
+    /// inside its own namespace still resolves here; the graph of what refers to
+    /// what comes along for the modal to draw.
+    pub fn ai_context(&mut self, nodes: &[String]) -> LeanResult<AiContext> {
+        let (terms, uses) = self.ai_catalog()?;
+        // Breadth-first over "uses": everything the seeds depend on comes too.
+        let seeds: HashSet<usize> = nodes
+            .iter()
+            .filter_map(|id| terms.iter().position(|term| &term.id == id))
+            .collect();
+        let mut wanted: HashSet<usize> = seeds.clone();
+        let mut queue: Vec<usize> = seeds.iter().copied().collect();
+        while let Some(index) = queue.pop() {
+            for (from, to) in &uses {
+                if *from == index && wanted.insert(*to) {
+                    queue.push(*to);
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(AiContext::default());
+        }
+        let mut chosen: Vec<&logic::Term> = wanted.iter().map(|index| &terms[*index]).collect();
+        // File order first, then where it sits in the file: the reader sees the
+        // source as it is written.
+        chosen.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+
+        let mut files: Vec<String> = Vec::new();
+        for term in &chosen {
+            if !files.contains(&term.path) {
+                files.push(term.path.clone());
+            }
+        }
+        // Imports of those files, minus the project's own modules.
+        let mut imports: Vec<String> = Vec::new();
+        for rel in &files {
+            let source = self.fs.read(rel)?;
+            for line in source.lines() {
+                let trimmed = line.trim_start();
+                if let Some(module) = trimmed.strip_prefix("import ") {
+                    let module = module.trim().to_string();
+                    if !imports.contains(&module)
+                        && !files.iter().any(|file| module_matches(file, &module))
+                    {
+                        imports.push(module);
+                    }
+                }
+            }
+        }
+
+        let mut out = String::new();
+        out.push_str(&format!(
+            "-- KLEAN context: {} declaration(s) from {} file(s)\n",
+            chosen.len(),
+            files.len()
+        ));
+        for module in &imports {
+            out.push_str(&format!("import {module}\n"));
+        }
+        if !imports.is_empty() {
+            out.push('\n');
+        }
+
+        // Declarations stay inside the namespaces they were written in, so that a
+        // name which resolves among its siblings still resolves here.
+        let mut open: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for term in &chosen {
+            if current != term.path {
+                if !current.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&format!("-- ─── {} ───\n", term.path));
+                current = term.path.clone();
+            }
+            // Open what is missing, close what is no longer used.
+            let shared = common_prefix(&open, &term.namespaces);
+            while open.len() > shared {
+                out.push_str("end\n");
+                open.pop();
+            }
+            for namespace in &term.namespaces[shared..] {
+                out.push_str(&format!("namespace {namespace}\n"));
+                open.push(namespace.clone());
+            }
+            if let Ok(detail) = self.detail(&term.id) {
+                if let Some(doc) = &detail.doc {
+                    let lines: Vec<&str> =
+                        doc.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+                    if lines.len() == 1 {
+                        out.push_str(&format!("/-- {} -/\n", lines[0]));
+                    } else {
+                        out.push_str("/--\n");
+                        for line in lines {
+                            out.push_str(&format!("  {line}\n"));
+                        }
+                        out.push_str("-/\n");
+                    }
+                }
+                if let Some(comments) = &detail.comments {
+                    for line in comments.lines() {
+                        out.push_str("-- ");
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+                out.push_str(&detail.text);
+                out.push('\n');
+            }
+        }
+        while !open.is_empty() {
+            out.push_str("end\n");
+            open.pop();
+        }
+
+        // The graph: what the context holds, and what refers to what. Only edges
+        // between declarations that made it into the context are useful to draw.
+        let seed_ids: HashSet<&str> = seeds.iter().map(|index| terms[*index].id.as_str()).collect();
+        let graph_nodes: Vec<AiContextNode> = chosen
+            .iter()
+            .map(|term| AiContextNode {
+                id: term.id.clone(),
+                label: if term.qual.is_empty() {
+                    term.label.clone()
+                } else {
+                    term.qual.clone()
+                },
+                kind: term.kind.to_string(),
+                seed: seed_ids.contains(term.id.as_str()),
+            })
+            .collect();
+        let kept: HashSet<&str> = graph_nodes.iter().map(|node| node.id.as_str()).collect();
+        let edges = uses
+            .iter()
+            .filter(|(from, to)| wanted.contains(from) && wanted.contains(to))
+            .map(|(from, to)| (terms[*from].id.clone(), terms[*to].id.clone()))
+            .filter(|(from, to)| kept.contains(from.as_str()) && kept.contains(to.as_str()))
+            .collect();
+
+        Ok(AiContext {
+            text: out,
+            nodes: graph_nodes,
+            edges,
+        })
+    }
+
+    /// The project's declarations, for the `view_ast` tool: a text tree the model
+    /// can search to find the names it wants.
+    pub fn ai_view_ast(&mut self, query: &str, depth: usize) -> LeanResult<String> {
+        let (terms, _) = self.ai_catalog()?;
+        let needle = query.trim().to_lowercase();
+        let mut out = String::new();
+        let mut shown = 0usize;
+        for term in &terms {
+            if !needle.is_empty()
+                && !term.qual.to_lowercase().contains(&needle)
+                && !term.path.to_lowercase().contains(&needle)
+            {
+                continue;
+            }
+            let indent = "  ".repeat(depth.min(term.namespaces.len()));
+            let status = match term.status.as_deref() {
+                Some("proven") => " ✓",
+                Some("sorry") => " (sorry)",
+                Some("error") => " (error)",
+                _ => "",
+            };
+            let signature = term
+                .signature
+                .as_deref()
+                .map(|sig| format!(" {sig}"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "{indent}{} {} : {}{}{}\n",
+                term.kind, term.qual, term.path, signature, status
+            ));
+            shown += 1;
+            if shown >= 400 {
+                out.push_str("… (truncated: narrow the query)\n");
+                break;
+            }
+        }
+        if shown == 0 {
+            out.push_str("no declarations matched\n");
+        }
+        Ok(out)
+    }
+
+    /// Resolves the names a model asked for through `expand`.
+    pub fn ai_expand(&mut self, names: &[String]) -> LeanResult<(Vec<String>, Vec<String>)> {
+        let (terms, _) = self.ai_catalog()?;
+        let mut ids = Vec::new();
+        let mut missing = Vec::new();
+        for name in names {
+            let wanted = name.trim();
+            match terms
+                .iter()
+                .find(|term| term.qual == wanted)
+                .or_else(|| terms.iter().find(|term| term.label == wanted))
+            {
+                Some(term) => {
+                    if !ids.contains(&term.id) {
+                        ids.push(term.id.clone());
+                    }
+                }
+                None => missing.push(wanted.to_string()),
+            }
+        }
+        Ok((ids, missing))
+    }
+
+    /// The project's declarations and their use edges, for the AI context.
+    fn ai_catalog(&mut self) -> LeanResult<(Vec<logic::Term>, Vec<(usize, usize)>)> {
+        let catalog = self.logic_catalog()?;
+        Ok((catalog.terms, catalog.uses))
+    }
+
     // ----------------------------------------------------------------- logic
 
     /// Every term of the project plus the uses between them, which is what both
@@ -1395,10 +1856,7 @@ impl Project {
         let (rel, span) = match self.resolve(id)? {
             Target::Ast { rel, path } => {
                 let cached = self.load(&rel, Parse::Tree)?;
-                let node = cached
-                    .parsed
-                    .get(&path)
-                    .ok_or_else(|| LeanError::msg(format!("node `{id}` no longer exists")))?;
+                let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
                 (rel, node.span)
             }
             _ => return Err(LeanError::msg("only a declaration can be removed")),
@@ -1536,6 +1994,16 @@ impl Project {
 }
 
 // ------------------------------------------------------------------- helpers
+
+/// A node the tree does not hold — or does not hold *yet*: while the background
+/// read is preparing Lean's parser, a file's declarations have not arrived.
+fn node_missing(id: &str) -> LeanError {
+    if crate::lean::scan::warming() {
+        LeanError::msg("the project is still being read: try again in a moment")
+    } else {
+        LeanError::msg(format!("node `{id}` no longer exists"))
+    }
+}
 
 /// Longest line a written `--` comment may run to.
 const COMMENT_WIDTH: usize = 200;
@@ -1731,6 +2199,38 @@ fn join_path(path: &[usize]) -> String {
         .map(|index| index.to_string())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// A reduced AI context: the Lean source, and the declarations it holds.
+#[derive(Debug, Clone, Default)]
+pub struct AiContext {
+    pub text: String,
+    pub nodes: Vec<AiContextNode>,
+    /// `(from, to)`: from refers to to.
+    pub edges: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AiContextNode {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    /// True for the declarations the request started from.
+    pub seed: bool,
+}
+
+/// How many leading namespaces two chains share.
+fn common_prefix(open: &[String], wanted: &[String]) -> usize {
+    let mut shared = 0;
+    while shared < open.len() && shared < wanted.len() && open[shared] == wanted[shared] {
+        shared += 1;
+    }
+    shared
+}
+
+/// True when `module` names the file `rel` (the project's own module).
+fn module_matches(rel: &str, module: &str) -> bool {
+    rel.trim_end_matches(".lean").replace('/', ".") == module
 }
 
 fn file_name(rel: &str) -> String {
@@ -2399,7 +2899,7 @@ theorem todo : two = 3 := by sorry
     }
 
     /// Finds a file node by path in the workspace tree.
-    fn find_file<'a>(node: &'a TreeNode, rel: &str) -> Option<&'a TreeNode> {
+    pub(super) fn find_file<'a>(node: &'a TreeNode, rel: &str) -> Option<&'a TreeNode> {
         if node.kind == "file" && node.path.as_deref() == Some(rel) {
             return Some(node);
         }
@@ -2445,6 +2945,126 @@ mod editor_tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    /// A preview checks the text Lean has, not the file on disk: nothing is written,
+    /// the draft is what the tree and the diagnostics read, and discarding it puts
+    /// the saved file back in front of Lean.
+    #[test]
+    fn a_preview_checks_in_memory_and_leaves_the_disk_alone() {
+        let root = scratch("preview");
+        let path = root.join("Demo/Basic.lean");
+        let mut project = match Project::open(&root, std::env::temp_dir().join("klean-test-appdata"))
+        {
+            Ok(project) => project,
+            Err(error) => {
+                eprintln!("cannot open the project without Lean: {error}");
+                return;
+            }
+        };
+        project.view().expect("view");
+        project.check_file("Demo/Basic.lean").expect("check");
+        settle(&mut project);
+        let before = std::fs::read_to_string(&path).expect("file");
+        let id = project
+            .view()
+            .expect("view")
+            .tree
+            .first()
+            .and_then(|lib| super::tests::find_file(lib, "Demo/Basic.lean"))
+            .and_then(|file| file.children.first().cloned())
+            .map(|node| node.id)
+            .expect("the definition");
+
+        // An edit Lean cannot accept: it has to be *reported*, which means Lean was
+        // given the text.
+        let preview = project
+            .preview(&id, "def two : Nat := missingTerm")
+            .expect("preview");
+        assert_eq!(preview.detail.text.trim(), "def two : Nat := missingTerm");
+        assert!(project.has_draft(&id), "the edit is held as a draft");
+        settle(&mut project);
+        let checked = project.detail(&id).expect("detail");
+        assert!(
+            checked
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == "error"),
+            "Lean checked the typed text: {:?}",
+            checked.diagnostics
+        );
+        // The disk never saw it.
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("file"),
+            before,
+            "a preview writes nothing"
+        );
+
+        // Discarding gives Lean the saved file back.
+        project.discard_draft(&id).expect("discard");
+        assert!(!project.has_draft(&id));
+        settle(&mut project);
+        let restored = project.detail(&id).expect("detail");
+        assert!(restored.text.contains("def two : Nat := 2"), "{}", restored.text);
+        assert!(
+            restored
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity != "error"),
+            "{:?}",
+            restored.diagnostics
+        );
+
+        // Saving is the one path that writes.
+        project.update(&id, "def two : Nat := 3").expect("save");
+        let after = std::fs::read_to_string(&path).expect("file");
+        assert!(after.contains("def two : Nat := 3"), "{after}");
+        assert!(!project.has_draft(&id), "a save ends the draft");
+    }
+
+    /// Opening a project is a filesystem walk, nothing more: the declarations are
+    /// what the background scan adds afterwards.
+    #[test]
+    fn opening_a_project_reads_nothing_until_the_scan_runs() {
+        let root = scratch("listing");
+        let mut project = Project::open(&root, std::env::temp_dir().join("klean-test-appdata"))
+            .expect("project");
+
+        let listing = project.view_listing().expect("listing");
+        assert!(listing.pending, "the view says its files are unread");
+        let file = listing
+            .tree
+            .first()
+            .and_then(|lib| super::tests::find_file(lib, "Demo/Basic.lean"))
+            .expect("the module is listed");
+        assert!(
+            file.children.is_empty(),
+            "the listing carries no declarations: {:?}",
+            file.children.iter().map(|node| &node.label).collect::<Vec<_>>()
+        );
+        assert_eq!(file.detail.as_deref(), Some("not parsed yet"));
+
+        // What the background scan does, one file at a time.
+        let files = project.scan_files();
+        assert!(files.contains(&"Demo/Basic.lean".to_string()), "{files:?}");
+        for rel in &files {
+            project.scan_file(rel).expect("scan reads the file");
+        }
+        if !project.lean_status().available {
+            eprintln!("no Lean toolchain: skipping the declaration check");
+            return;
+        }
+
+        let full = project.view().expect("view");
+        assert!(!full.pending, "the files have been read");
+        let file = full
+            .tree
+            .first()
+            .and_then(|lib| super::tests::find_file(lib, "Demo/Basic.lean"))
+            .expect("the module is listed");
+        let labels: Vec<&str> = file.children.iter().map(|node| node.label.as_str()).collect();
+        assert!(labels.contains(&"two"), "the declarations arrived: {labels:?}");
+        assert!(labels.contains(&"t"), "the declarations arrived: {labels:?}");
     }
 
     /// Typing a term Lean does not know has to show up as an error in the editor.
@@ -2528,6 +3148,132 @@ mod editor_tests {
         }
         let text = text.expect("Lean knows what `two` is");
         assert!(text.contains("two") || text.contains("Nat"), "{text:?}");
+    }
+
+    /// The reduced Lean source an AI request is given: the declaration asked
+    /// about, what it depends on, and the imports that make the result compile.
+    #[test]
+    fn ai_context_is_a_small_compilable_file() {
+        let root = std::env::temp_dir().join("klean-test-ai-context");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Demo")).expect("project dir");
+        std::fs::write(
+            root.join("lakefile.toml"),
+            "name = \"demo\"\n\n[[lean_lib]]\nname = \"Demo\"\n",
+        )
+        .expect("lakefile");
+        std::fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.36.0-rc2\n")
+            .expect("toolchain");
+        std::fs::write(root.join("Demo.lean"), "import Demo.Basic\n").expect("root module");
+        std::fs::write(
+            root.join("Demo/Basic.lean"),
+            "import Init\n\n/-- The number two. -/\ndef two : Nat := 2\n\n/-- Two is two. -/\ntheorem t : two = 2 := rfl\n",
+        )
+        .expect("module");
+
+        let mut project = Project::open(&root, std::env::temp_dir().join("klean-test-appdata"))
+            .expect("project");
+        let view = project.view().expect("view");
+        let file = find(&view.tree[0], "Demo/Basic.lean").expect("module");
+        let theorem = file
+            .children
+            .iter()
+            .find(|node| node.kind == "theorem")
+            .map(|node| node.id.clone())
+            .expect("the theorem");
+
+        let context = project.ai_context(&[theorem]).expect("context").text;
+        assert!(context.contains("import Init"), "imports travel with it:\n{context}");
+        assert!(
+            !context.contains("import Demo.Basic"),
+            "the project's own modules are not imports:\n{context}"
+        );
+        assert!(context.contains("theorem t : two = 2"), "{context}");
+        assert!(
+            context.contains("def two : Nat := 2"),
+            "the dependency is included:\n{context}"
+        );
+        assert!(context.contains("The number two."), "docs come along:\n{context}");
+        // Written in file order: the definition before the theorem.
+        let def_at = context.find("def two").unwrap();
+        let theorem_at = context.find("theorem t").unwrap();
+        assert!(def_at < theorem_at, "file order:\n{context}");
+    }
+
+    /// Declarations keep their namespaces, so a name that resolves among siblings
+    /// still resolves in the reduced file.
+    #[test]
+    fn ai_context_keeps_namespaces_and_reports_the_graph() {
+        let root = std::env::temp_dir().join("klean-test-ai-namespace");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Demo")).expect("project dir");
+        std::fs::write(root.join("lakefile.toml"), "name = \"demo\"\n").expect("lakefile");
+        std::fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.36.0-rc2\n")
+            .expect("toolchain");
+        std::fs::write(
+            root.join("Demo.lean"),
+            "namespace Demo\n\ndef base : Nat := 1\n\ntheorem usesBase : base = 1 := rfl\n\nend Demo\n",
+        )
+        .expect("module");
+        let mut project = Project::open(&root, std::env::temp_dir().join("klean-test-appdata"))
+            .expect("project");
+        let view = project.view().expect("view");
+        let namespace = &view.tree[0].children[0].children[0];
+        let theorem = namespace
+            .children
+            .iter()
+            .find(|node| node.kind == "theorem")
+            .map(|node| node.id.clone())
+            .expect("the theorem");
+
+        let context = project.ai_context(&[theorem]).expect("context");
+        assert!(
+            context.text.contains("namespace Demo"),
+            "the namespace is kept:\n{}",
+            context.text
+        );
+        assert!(context.text.contains("end"), "and closed again:\n{}", context.text);
+        assert!(
+            context.text.find("namespace Demo").unwrap() < context.text.find("def base").unwrap(),
+            "the declaration is inside it:\n{}",
+            context.text
+        );
+        // The graph knows the pair and their edge.
+        let labels: Vec<&str> = context.nodes.iter().map(|node| node.label.as_str()).collect();
+        assert!(labels.contains(&"Demo.base"), "{labels:?}");
+        assert!(labels.contains(&"Demo.usesBase"), "{labels:?}");
+        assert_eq!(context.edges.len(), 1, "{:?}", context.edges);
+        assert!(context.nodes.iter().any(|node| node.seed && node.label == "Demo.usesBase"));
+    }
+
+    /// `view_ast` and `expand` are what let the model look further than its context.
+    #[test]
+    fn ai_tools_find_and_expand_nodes() {
+        let root = std::env::temp_dir().join("klean-test-ai-tools");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Demo")).expect("project dir");
+        std::fs::write(root.join("lakefile.toml"), "name = \"demo\"\n").expect("lakefile");
+        std::fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.36.0-rc2\n")
+            .expect("toolchain");
+        std::fs::write(
+            root.join("Demo.lean"),
+            "def two : Nat := 2\n\ntheorem t : two = 2 := rfl\n",
+        )
+        .expect("module");
+        let mut project = Project::open(&root, std::env::temp_dir().join("klean-test-appdata"))
+            .expect("project");
+
+        let listing = project.ai_view_ast("two", 1).expect("listing");
+        assert!(listing.contains("two"), "{listing}");
+
+        let (ids, missing) = project
+            .ai_expand(&["t".to_string(), "nope".to_string()])
+            .expect("expand");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(missing, vec!["nope".to_string()]);
+        let text = project.ai_context(&ids).expect("context").text;
+        assert!(text.contains("theorem t"), "{text}");
+        assert!(text.contains("def two"), "expansion pulls in what it needs: {text}");
     }
 
     /// Notes are written as `--` lines and wrapped at 200 characters.

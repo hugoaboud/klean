@@ -69,6 +69,12 @@ Interaction, on either board:
   the file is rewritten at most every five seconds (and whenever the project is switched)
 - AI settings are off by default; the model URL and the API key live in `.klean.secrets`
   (added to the project's `.gitignore` on first write), never in `.klean.json`
+- **AI** is a modal of its own (`src-tauri/klean-ai`): every request opens a *session*
+  (one tab), the modal keeps them all until you close them, and the `AI` button in the top
+  bar brings it back. A session's feed holds four kinds of entry — KLEAN's **context** (the
+  reduced Lean source), your **input**, the model's **output** (reasoning, text, or a
+  generated markdown document) and the **MCP tool calls** it made. Closing the modal keeps
+  the sessions; nothing is persisted across restarts.
 - the settings tree lives in Rust (`src-tauri/src/lean/settings.rs`); the settings button in
   the graph's top-right corner opens it. `Logic → Sections` decides which column each kind
   of declaration lands in, so renaming a section renames the column in both the graph and
@@ -197,20 +203,105 @@ around it untouched. `namespace`/`section`/`mutual` blocks are nested by pairing
 commands with the matching `end`, and doc/plain comments are recovered from the text
 between one command and the next (Lean's tree does not carry them).
 
+### The AI modal and its tools
+
+An AI request starts where it makes sense — the editor's prompt box asks about the node you
+are reading — and opens a session seeded with that node. Before a prompt is sent, KLEAN
+writes the **reduced Lean source** for the request: the declaration, everything it uses
+(followed recursively through the logic board's use edges), their doc comments and notes,
+and the imports those files declare. A model therefore sees a small compilable file rather
+than the project.
+
+Models can look further with the six tools KLEAN implements itself (`Settings → AI →
+Tools` switches each one off or on):
+
+| tool | what it does |
+| --- | --- |
+| `view_ast` | lists the project's declarations as text, filtered by a query |
+| `expand` | pulls more nodes into the session's context, by fully qualified name |
+| `lean_check` | Lean's own `#check` for an expression, with the whole project in scope |
+| `diagram` | shows a mermaid diagram to the user |
+| `ask` | asks the user, with answers to pick from; the worker waits for the answer |
+| `ask_multi` | the same, allowing several answers |
+
+`Settings → AI → Customize → System Prompt` appends your own instructions to KLEAN's built-in
+system prompt for every session — the built-in rules stay (a user shouldn't have to restate
+what the tools are), and the customisation is introduced as taking precedence. The built-in
+text lives in `src-tauri/klean-ai/src/prompts.rs`; the custom one is stored in `.klean.json`.
+
+The **+** button in the tab row starts a session with **no context at all** — nothing from the
+board, no Lean source — for a question that is not about one theorem. The model finds what it
+needs with `view_ast` and `expand`, or asks Lean directly with `lean_check`. The prompt box
+belongs to the open session, so with no tab there is none.
+
+`lean_check` runs `lake env lean --stdin --json` over a source that imports every module the
+project has built and then the model's expression, so Mathlib and the project's own
+declarations are in scope. `lake env` is what puts the dependencies on Lean's search path; only
+built modules are imported, because one unbuilt import would end the check. The run happens
+outside the project lock, so the board stays usable while Lean thinks, and it is bounded by the
+*Lean → timeout* setting. Without build output the tool says so instead of guessing.
+
+A `diagram` call is drawn *before* the model is told it worked: the modal renders the call's own
+mermaid source and reports back whether it parsed. When it did not, mermaid's complaint goes to
+the model as the tool result and it may retry — up to three retries, after which `diagram` is
+refused and it is asked to answer in words. (The wire the model reads says "the diagram is on
+screen"; the picture comes from the call's `mermaid` argument, never from that sentence.)
+
+Every text a model is shown — the system prompt, each tool's description and parameters, the
+line that introduces the context, and each tool's result — lives in
+`src-tauri/klean-ai/src/prompts.rs`, so it can be reworded without touching code.
+
+Answers are shown as a markdown preview (`marked`, sanitised with `dompurify`) and
+```mermaid fences are drawn as diagrams (mermaid is loaded the first time one appears).
+Every entry except the model's own output folds to a one-line preview — a context, a prompt
+and each tool call with the arguments it was given. The model's answer is rendered markdown at
+1.5× the surrounding text, since it is what the tab is for.
+
+A context entry has two views: **graph**, which draws the declarations it holds and which one
+pulled which in, and **lean**, the reduced file that is actually sent. Declarations stay
+inside their original namespaces, so a name that resolves among its siblings still resolves
+there. `expand` answers with the *new* context, which also appears in the feed as its own
+entry.
+
+The line under the feed reports tokens **in · out · total** and, when the model has a
+published price, what the session has cost in dollars (four decimals); a model KLEAN does not
+know the price of shows tokens only.
+
+Three provider families are configured in `Settings → AI → Model`: **DeepSeek**,
+**Claude** (Anthropic's Messages API) and anything **OpenAI-compatible**. Streaming is plain
+blocking IO on a thread per session, which is what lets several sessions run at once, and
+reasoning is shown when the provider exposes it (`reasoning_content` on DeepSeek,
+`thinking_delta` on Claude).
+
 ### What opening a project costs
 
-Nothing runs until you ask. Opening a project reads the file list and parses it with **one**
-Lean environment (`Init`/`Lean`): no project module is loaded, so memory does not grow with
-the project. Measured here: 150 files and 600 files both open at ~210 MB, and no Lean
-process is started.
+Opening a project parses **nothing**: the board is built from the file listing, so it is on
+screen in a few hundred milliseconds however large the project is. The declarations arrive
+afterwards, from a background job (`src-tauri/src/lean/scan.rs`) that reads the files one at
+a time and reports into the build console — `3/16 files · Core/Types.lean` — with a stop
+button. Until it reaches a file, that file's node says `not parsed yet`.
 
-- **Parsing** a whole project is microseconds per file. Only the file you open in the editor
-  is re-parsed with *its* imports loaded, and only once the project has been built; the
-  parser keeps at most two such environments, so a session cannot accumulate them.
+The read reuses **one** Lean environment (`Init`/`Lean`) for the whole project: no project
+module is loaded, so memory does not grow with the project. Measured here: 150 files and
+600 files both open at ~210 MB, and no Lean process is started.
+
+- **Building that environment is the one slow step** — Lean imports its own `Init` and
+  `Lean` modules, seconds rather than milliseconds — so it happens on the scan's own thread,
+  *off* the project lock, and everything after it is milliseconds. While it runs, commands
+  that would need the parser answer with a note instead of queueing behind it.
+- **Parsing** a file is microseconds. Only the file you open in the editor is re-parsed with
+  *its* imports loaded, and only once the project has been built; the parser keeps at most
+  two such environments, so a session cannot accumulate them.
 - **Checking** is per file: opening a node hands that one file to the language server, which
   keeps its own process and reports diagnostics as it finds them. Editing a node sends only
   that file's change (one replaced range) and re-checks only that file; the rest of the
   project is untouched, so typing stays responsive no matter how large the project is.
+- **Typing is checked, not saved.** KLEAN never writes while you type: the edited declaration
+  is spliced into the file *in memory*, handed to Lean at once, and the diagnostics come back
+  under the caret — the board's tree is left out of that path, which is what keeps a keystroke
+  cheap. The file on disk changes only when you save (Ctrl/Cmd+S or the *save* button), and
+  closing the editor with an unsaved edit asks first, like the settings modal. Discarding puts
+  the saved text back in front of Lean, so nothing stale is left behind.
 - **The welcome page does nothing**: no parsing, no server, no build — the binary sits at
   ~200 MB and no Lean process exists until a project is opened.
 - **Building** is the one expensive action, so it is a question, not a side effect: when a
