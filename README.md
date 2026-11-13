@@ -208,21 +208,35 @@ nothing, and the module is a lazy chunk:
 ```
 src/editor/monaco.ts        loads Monaco once, registers Lean's lexer and KLEAN's theme,
                             turns `Ctrl+Shift+ArrowUp` into a Monaco keybinding
+src/editor/lean-language.ts Monaco's Monarch grammar for Lean: keywords, tactics, strings,
+                            numbers, and the block comments that *nest* (`npm test` covers it)
 src/editor/keys.ts          the shortcut strings the settings hold (`npm test` covers it)
+src/lib/lean-tex.ts         `\`-input: `\all` → `∀`, `\->` → `→` (`npm test` covers it)
 src/components/ui/CodeEditor.vue  the seam between Monaco and the app
 ```
+
+The lexer is data, not a Monaco dependency, and it is checked without Monaco: a small driver
+matches the rules the way Monarch does (first rule wins, `@comment`/`@push`/`@pop`) over real Lean
+source. That is what pins the bug that made **every file** grey while node text looked fine: a
+Lean file opens with a `/-! … -/` module doc comment, and the rule that ends a comment sat
+behind a rule that ate its `-`, so the comment state never popped and the rest of the file was one
+long comment token.
 
 `CodeEditor.vue` owns only what Monaco cannot know:
 
 - **a model per document** (`ast:<file>#<path>`, `file:<path>`): undo history and folding belong
-  to that node, and coming back to it finds them where they were left;
-- **the text in and out** — typing goes up as `update:modelValue` (which the store checks
-  against Lean without writing), a revert or a sibling save comes back down without a loop;
+  to that node, and coming back to it finds them where they were left (the editor is linked to
+  *nodes*, and a document can hold more than one after the user writes a second declaration);
+- **the text in and out** — typing goes up as `update:modelValue` (the store keeps it, and only
+  a save writes the file), a revert or a sibling save comes back down without a loop;
 - **Lean's diagnostics** as Monaco markers, on the file's own line numbers (the gutter is
   renumbered through `lineNumbers`), with Lean's message on hover;
 - **completions** from `textDocument/completion`: the suggestions are Lean's — keywords, tactics,
   the names in scope, the fields of the structures in scope — because they come from the server
   that elaborated the file;
+- **Lean's LaTeX-style input**, which is not a completion: type `\` and the symbol list opens,
+  filtered as the name is typed, and a name followed by a space becomes its symbol (`\all` → `∀`,
+  `\->` → `→`, `\alpha` → `α`). The table is `src/lib/lean-tex.ts`, and `npm test` checks it;
 - **the app's shortcuts**, bound onto Monaco's own commands: `editor.action.addSelectionToNextFindMatch`
   (Ctrl+D), `selectHighlights` (Ctrl+Shift+L), `insertCursorAbove`/`Below` (Alt+Shift+Arrow),
   `copyLinesUpAction`/`DownAction` (Ctrl+Alt+Shift+Arrow), `actions.find`, `undo`, `redo`. The keys
@@ -234,17 +248,29 @@ One modal per node, and never two for the same file: opening the file a node liv
 that node's modal, a node of an open file replaces the file's modal, and the same node is never
 open twice — a double-click with the modifier raises it instead.
 
-**Two editors of one file are never edited at once.** The edited text of a file lives in Rust,
-once per file (`Project::drafts`), and both modals of that file read it — but the moment one of
-them holds an unsaved edit, the others are **locked** (read-only, with a line in the footer
-saying why). Saving writes the file, re-reads every open editor of it and unlocks them;
-discarding does the same with the disk's text. That is a merge rule two panels can keep, and it
+**Nothing is written while you type.** An editor holds its text; a save is the one thing that
+writes the file, replaces exactly the range the node occupies (the tree it came from is the tree the
+ids were built from, so the range is the one on screen), re-parses the file and tells every editor
+of it what their text is now. A node saved under a new name keeps the card the user had placed on
+the logic board and the theory it was filed under; a node that appeared because the text grew a
+second declaration lands next to the one it was typed beside.
+
+**An editor is linked to its node, not just to a string.** Typing another declaration into it makes
+it a document of *two* nodes: the save writes the range from the first to the last, and the pane
+remembers both, so saving again replaces that range once instead of appending to it. Closing the
+modal returns to one node per editor, each openable on its own.
+
+**Two editors of one file are never edited at once.** The moment one holds an unsaved edit the
+others are **locked** (read-only, with a line in the footer saying why); saving writes the file,
+re-reads every open editor of it and unlocks them. That is a merge rule two panels can keep, and it
 keeps a node modal and its file modal from disagreeing.
 
 Nodes are read from the **core parse** — the tree the board's ids were built from, always in the
 cache — rather than a parse with the file's imports loaded: the import environment is Lean
 building a library, and it bought nothing here (the language server parses the text it is given).
-That is what makes opening an editor instant even on a built project.
+That is what makes opening an editor instant even on a built project, and why Monaco's own undo
+cannot corrupt a file: nothing is spliced until the save, and the save takes its range from the
+file's tree rather than from the editor's history.
 
 A double-click while the modal holds an unsaved edit does not reload it: the modal says so and
 waits (discarding the edit continues to the node that was asked for). Any modification dismisses
@@ -280,6 +306,12 @@ implementation reported:
   works, and the modal says the same for the file it has open.
 - **build** — `lake build` makes the project's `.olean` files, which is what lets a file
   see its imports — for the parser's syntax extensions and for the server's checks alike.
+- **`#check`** — the **Check** button (`∀`, beside AI) opens a field, a **Check** button and
+  a card. What is typed is `#check`ed with every built module of the project imported, and
+  the answer is Lean's own words. It is not a second implementation: the command runs
+  `Project::check_plan` and `check::run` — the two calls the AI's `lean_check` tool makes —
+  so the process is the same `lake env lean` outside the project lock, and a check takes the
+  seconds that takes. That is why it is a button and not a keystroke.
 
 The tree KLEAN builds from those records is *structural*, like the sources: expressions and
 proofs stay verbatim, so an edit replaces exactly a node's byte span and leaves everything
@@ -386,13 +418,12 @@ module is loaded, so memory does not grow with the project. Measured here: 150 f
   keeps its own process and reports diagnostics as it finds them. Editing a node sends only
   that file's change (one replaced range) and re-checks only that file; the rest of the
   project is untouched, so typing stays responsive no matter how large the project is.
-- **Typing is checked, not saved.** KLEAN never writes while you type: once typing pauses
-  (*Editor → Check Debounce*, 200 ms by default) the edited declaration is spliced into the file
-  *in memory*, handed to Lean, and the diagnostics come back under the caret — the board's tree
-  is left out of that path, which is what keeps a keystroke cheap. The file on disk changes only
-  when you save (Ctrl/Cmd+S or the *save* button), and closing the editor with an unsaved edit
-  asks first, like the settings modal. Discarding puts the saved text back in front of Lean, so
-  nothing stale is left behind.
+- **Typing is local, saving is what Lean sees.** KLEAN never writes while you type: keystrokes
+  stay in Monaco, and a save is the one thing that splices the node's range into the file, hands
+  it to Lean and brings the diagnostics back under the caret. Closing the editor with an unsaved
+  edit asks first, like the settings modal; discarding puts the saved text back in front of Lean,
+  so nothing stale is left behind. The only live check is the **Check** card, which asks about
+  text that is nobody's file.
 - **The welcome page does nothing**: no parsing, no server, no build — the binary sits at
   ~200 MB and no Lean process exists until a project is opened.
 - **Building** is the one expensive action, so it is a question, not a side effect: when a

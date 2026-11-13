@@ -27,7 +27,14 @@ export interface Printed {
  */
 export interface EditorPane {
   id: string;
+  /** The node the pane is editing — the first of `nodeIds`. */
   nodeId: string;
+  /**
+   * Every node this one document holds. Typing another declaration into an editor
+   * gives it two: the save writes the range from the first to the last, and the
+   * nodes that appeared are placed beside the one they were written next to.
+   */
+  nodeIds: string[];
   detail: api.NodeDetail | null;
   goals: api.Goals | null;
   goalsBusy: boolean;
@@ -222,6 +229,7 @@ function createPane(nodeId: string): EditorPane {
   const pane: EditorPane = {
     id: `pane-${paneSeq}`,
     nodeId,
+    nodeIds: [nodeId],
     detail: null,
     goals: null,
     goalsBusy: false,
@@ -281,6 +289,7 @@ async function loadPane(pane: EditorPane) {
   // editor (and with it Monaco) on every step between two nodes.
   const wanted = pane.nodeId;
   pane.loading = true;
+  pane.nodeIds = [wanted];
   pane.goals = null;
   pane.term = null;
   pane.nodeGoals = null;
@@ -549,11 +558,6 @@ async function pollProcessing() {
 export function numberSetting(id: string, fallback: number): number {
   const value = Number.parseInt(settingValue(id, String(fallback)), 10);
   return Number.isFinite(value) && value > 0 ? value : fallback;
-}
-
-/** How long typing has to pause before Lean is asked about the node. */
-export function checkDebounce(): number {
-  return numberSetting("editor.check_debounce", 300);
 }
 
 /** The editor's shortcuts, as the settings spell them. */
@@ -1096,7 +1100,7 @@ export const actions = {
     const pending = pane.pending;
     pane.confirming = false;
     pane.pending = null;
-    await actions.discardPane(paneId);
+    await actions.revertPane(paneId);
     if (pending) {
       pane.nodeId = pending;
       await loadPane(pane);
@@ -1116,10 +1120,6 @@ export const actions = {
     if (state.activeEditor === paneId) {
       state.activeEditor = state.editors.at(-1)?.id ?? null;
     }
-    // The file's memory is only held while an editor of that file is open.
-    const rel = closing.detail?.path;
-    const shared = rel ? state.editors.some((pane) => pane.detail?.path === rel) : false;
-    if (rel && !shared) await api.discardDraft(closing.nodeId).catch(() => undefined);
     // The last editor is gone: the board can catch up with what was saved.
     if (state.editors.length === 0) await refreshAfterClose();
   },
@@ -1415,43 +1415,19 @@ export const actions = {
   },
 
   /**
-   * Checks the editor's text without saving it.
+   * Throws a pane's unsaved edit away, back to what is on disk.
    *
-   * The text goes to Rust, which splices it into the file in memory and hands it to
-   * Lean straight away; the answers (diagnostics, processing) come back as the
-   * detail the editor already shows. Nothing is written to disk.
+   * Nothing is written while the user types, so this only re-reads: the file, the
+   * node and its range are exactly where the last save left them.
    */
-  async previewText(paneId: string, text: string) {
-    const pane = state.editors.find((current) => current.id === paneId);
-    // A node renamed or replaced under the pane cannot take the text any more.
-    if (!pane || pane.detail?.id !== pane.nodeId) return;
-    pane.error = null;
-    try {
-      const result = await api.previewNode(pane.nodeId, text);
-      // Only the node: the board's tree is about saved work, and rebuilding it on
-      // every keystroke is exactly what made checking feel slow.
-      if (pane.detail?.id === pane.nodeId) pane.detail = result.detail;
-      // The node's own proof state follows the text too: the icon beside the
-      // comments should not wait for a save to turn green.
-      void loadNodeGoals(pane);
-      // The server publishes a moment later: follow it, so the diagnostics under
-      // the caret are Lean's, not the previous ones.
-      void pollProcessing();
-    } catch (error) {
-      pane.error = error instanceof Error ? error.message : String(error);
-    }
-  },
-
-  /** Throws a pane's unsaved edit away and re-checks what is on disk. */
-  async discardPane(paneId: string) {
+  async revertPane(paneId: string) {
     const pane = state.editors.find((current) => current.id === paneId);
     if (!pane) return;
     pane.dirty = false;
     const rel = pane.detail?.path;
     try {
-      await api.discardDraft(pane.nodeId);
       await loadPane(pane);
-      // The file is back to what is on disk, for every editor showing it.
+      // The file is what is on disk, for every editor showing it.
       await refreshFileEditors(rel, pane);
     } catch (error) {
       pane.error = error instanceof Error ? error.message : String(error);
@@ -1466,8 +1442,12 @@ export const actions = {
     pane.error = null;
     const rel = pane.detail?.path;
     try {
-      const result = await api.updateNode(pane.nodeId, text);
+      // The linked nodes go with the save: text that grew a second declaration is
+      // one document, and the range replaced runs from the first node to the last.
+      const result = await api.updateNode(pane.nodeId, text, pane.nodeIds);
       pane.detail = result.detail;
+      pane.nodeIds = result.nodes.length > 0 ? result.nodes : [result.id];
+      pane.nodeId = pane.nodeIds[0] ?? result.id;
       pane.dirty = false;
       pane.confirming = false;
       if (state.view) {

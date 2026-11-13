@@ -29,8 +29,6 @@ const props = defineProps<{
   termBusy?: boolean;
   /** The prompt row only exists when AI features are switched on. */
   aiEnabled?: boolean;
-  /** How long typing has to pause before Lean is asked (ms). */
-  debounce?: number;
   /** The shortcut combinations, as configured. */
   keys?: EditorKeys;
   /** The editor holds more than one caret. */
@@ -49,9 +47,7 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  /** The edited text, for Lean to check — nothing is written. */
-  preview: [string];
-  /** Save it: this is what reaches the disk. */
+  /** Save it: the one thing that writes the file and re-reads the tree. */
   save: [string];
   /** Whether there is an unsaved edit, for the close confirmation. */
   dirty: [boolean];
@@ -97,7 +93,6 @@ onMounted(() => {
 });
 
 const dirty = ref(false);
-let timer: number | undefined;
 
 watch(dirty, (value) => emit("dirty", value));
 
@@ -213,7 +208,6 @@ function endDrag(event: PointerEvent) {
 watch(
   () => props.detail?.id,
   () => {
-    window.clearTimeout(timer);
     text.value = props.detail?.text ?? "";
     comments.value = props.detail?.comments ?? "";
     dirty.value = false;
@@ -239,18 +233,9 @@ watch(
 function onInput(value: string) {
   text.value = value;
   if (!editable.value) return;
+  // Nothing reaches Rust until the save: the text belongs to the editor, and a save
+  // is the one thing that writes the file and re-reads the tree.
   dirty.value = true;
-  // Check once the user stops typing: Lean gets the text long before the disk does,
-  // so the goals and the errors follow the caret instead of the save button.
-  window.clearTimeout(timer);
-  timer = window.setTimeout(check, props.debounce ?? 300);
-}
-
-/** Sends the text for checking. Cheap: one node, no disk, no project walk. */
-function check() {
-  window.clearTimeout(timer);
-  if (!editable.value) return;
-  emit("preview", text.value);
 }
 
 /**
@@ -266,21 +251,18 @@ function onCaret(line: number, character: number) {
 
 /** Saves what is in the editor. The only path that writes to disk. */
 function save() {
-  window.clearTimeout(timer);
   if (!dirty.value || !editable.value) return;
   dirty.value = false;
   emit("save", text.value);
 }
 
 /**
- * Puts the saved text back, in the editor and in front of Lean.
+ * Puts the saved text back.
  *
- * The editor must not read it from `detail` — that is the *draft*, which is what is
- * being discarded. Reverting asks Rust to drop the draft, and the reloaded detail
- * comes back with the saved text.
+ * Nothing was written while typing, so reverting is a reload: the parent re-reads
+ * the node from the file and the editor takes the text it comes back with.
  */
 function revert() {
-  window.clearTimeout(timer);
   dirty.value = false;
   emit("revert");
 }
@@ -307,7 +289,6 @@ function flushComments() {
 }
 
 onBeforeUnmount(() => {
-  window.clearTimeout(timer);
   window.clearTimeout(commentTimer);
 });
 </script>

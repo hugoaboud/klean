@@ -45,8 +45,7 @@ pub use toolchain::Toolchain;
 
 pub use dto::{
     FixedNode, GraphExternal, GraphLayer, GraphLink, GraphNode, LogicGraph, NodeDetail,
-    PreviewResult, ProjectGraph, ProjectSummary, RecentProject, TheoryRef, UpdateResult,
-    WorkspaceView,
+    ProjectGraph, ProjectSummary, RecentProject, TheoryRef, UpdateResult, WorkspaceView,
 };
 pub use error::{LeanError, LeanResult};
 pub use project::Project;

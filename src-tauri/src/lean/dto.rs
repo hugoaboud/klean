@@ -153,22 +153,14 @@ pub struct UpdateResult {
     /// True while the language server is still checking: the diagnostics above
     /// are the previous ones, and the UI should ask again shortly.
     pub processing: bool,
-}
-
-/// The answer to a keystroke: the node as it now reads, and what Lean says about it.
-///
-/// Nothing here touches the disk. The board's tree is not in it either — a preview
-/// is about one declaration — which is what keeps typing cheap.
-#[derive(Debug, Clone, Serialize)]
-pub struct PreviewResult {
-    pub id: String,
-    pub detail: NodeDetail,
-    pub diagnostics: Vec<DiagnosticDto>,
-    /// True when Lean reported no errors for the edited file.
-    pub ok: bool,
-    /// True while the language server is still checking: the diagnostics above are
-    /// the previous ones, and the UI should ask again shortly.
-    pub processing: bool,
+    /// Every declaration the saved text now holds, in file order. More than one when
+    /// the editor grew another node: the pane is linked to all of them.
+    #[serde(default)]
+    pub nodes: Vec<String>,
+    /// The saved text as the file now reads between those nodes — the document the
+    /// editors of this file should show.
+    #[serde(default)]
+    pub text: String,
 }
 
 /// A remembered graph view, so a board looks the same when reopened.

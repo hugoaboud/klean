@@ -6,33 +6,25 @@
 //! code. Nothing else in the crate writes prose for a model.
 
 /// The opening message of every session.
-pub const SYSTEM: &str = "\
-You are KLEAN's assistant, working inside a Lean 4 project. The user gives you the Lean \
-source of the declarations that matter for a request — not the whole project — and a \
-question about them.
-
-How to work:
-- Read the context before answering. Only use names that appear in it or that you have \
-brought in with a tool.
-- If you need more of the project, call `view_ast` to look around and `expand` to pull \
-declarations in by their fully qualified name. Expanding returns the new, complete context.
-- Write Lean as it would appear in a file: no `import` lines, and no surrounding markdown \
-fence unless you are marking the block as `lean`.
-- Keep answers short and correct. Explain with a sentence or two, only output code if asked to.
-- A document the user asked for goes in a ```markdown fence, so KLEAN can show it as a file.
-- A picture that explains better than words goes through `diagram`.
-- A decision that belongs to the user goes through `ask` or `ask_multi` instead of a guess.
-";
+pub const SYSTEM: &str = "This is a Lean4 project, your goal is to assist the user with it. \n\n\
+- Before every prompt you'll be given a working Lean4 file with a subset of terms from the main project, called LCONTEXT. \
+- If you need a bigger subset, tool `view_ast` allows you to look around and tool `expand` allows adding \
+other nodes to LCONTEXT (dependee nodes are also added, no need to ask for them). \
+- Answer in Markdown. If a diagram helps describing a concept, the tool `diagram` can be used. \
+- Don't assume anything beyond what's deducible from LCONTEXT, there's no limit for the `ask` and `ask_multi` tools. \
+- You MUST only answer based on the axioms of LCONTEXT, nothing else. Short and concise answers. \
+- Non-trivial answers require using the tool `lean_check` to validate hypothesis. \
+- When presenting evidence, always include the filename and line; a code snippet; and the result of #check for an example (if non-trivial).";
 
 /// The line that introduces the user's own instructions, when they added any in
 /// `Settings → AI → Customize`.
-pub const CUSTOM_INTRO: &str = "Additional instructions from the user, which take precedence over the above:";
+pub const CUSTOM_INTRO: &str = "Additional steering (doesn't override the above):";
 
 /// The line that introduces the reduced Lean source in the conversation.
-pub const CONTEXT_INTRO: &str = "Context from the KLEAN project:";
+pub const CONTEXT_INTRO: &str = "LCONTEXT:";
 
 /// What `expand` says back when it brought nodes in.
-pub const EXPAND_INTRO: &str = "Nodes added to the context. The context is now:";
+pub const EXPAND_INTRO: &str = "LCONTEXT expanded with new nodes:";
 
 // ------------------------------------------------------- tool results (text the model reads)
 
@@ -48,7 +40,7 @@ pub fn tool_failed(reason: &str) -> String {
 
 /// A tool KLEAN knows but has no implementation for.
 pub fn not_implemented(name: &str) -> String {
-    format!("`{name}` is not implemented in this version of KLEAN.")
+    format!("The tool `{name}` is not implemented")
 }
 
 /// The result of `diagram` when the picture was drawn. The model only needs to know
@@ -63,7 +55,7 @@ pub fn diagram_shown() -> String {
 /// wanted — that is what lets the model fix the syntax instead of guessing.
 pub fn diagram_failed(attempt: u32, left: u32, error: &str) -> String {
     format!(
-        "KLEAN could not draw that diagram; this was attempt {attempt}. Mermaid reported:\n\n\
+        "Could not draw that diagram; this was attempt {attempt}. Mermaid reported:\n\n\
          ```\n{error}\n```\n\n\
          Fix the syntax and call `diagram` again — {left} retr{} left. Quoting an edge label \
          (`A -->|\"text with punctuation (or arrows)\"| B`) is usually what is missing. If the \
@@ -130,17 +122,17 @@ error Lean reported.";
 
     pub const ASK: &str = "\
 Ask the user a question and offer answers. The answer the user picks comes back to you as \
-the result of this call. Use it when a decision is theirs, not yours.";
+the result of this call. Use it anytime a decision cannot be backed by the axioms presented in LCONTEXT.";
 
     pub const ASK_MULTI: &str = "\
 Ask the user a question where more than one answer may apply. All the answers the user \
-picks come back to you as the result of this call.";
+picks come back to you as the result of this call. Use it anytime a conclusion cannot be backed by the axioms presented in LCONTEXT.";
 }
 
 /// Descriptions of the parameters, per tool.
 pub mod param {
     pub const QUERY: &str = "Filter: part of a name, a namespace, or a file path. Empty lists the most important declarations.";
-    pub const DEPTH: &str = "How deep to indent the listing (default 2).";
+    pub const DEPTH: &str = "How deep to indent the listing (default 1).";
     pub const NAMES: &str = "Fully qualified names to add, e.g. [\"Demo.foo\", \"Demo.bar\"].";
     pub const MERMAID: &str = "The mermaid source, e.g. `graph TD; A-->B`.";
     pub const EXPRESSION: &str = "The Lean term to check, e.g. `Demo.foo` or `(fun x : Nat => x + 1)`.";

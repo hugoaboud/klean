@@ -19,6 +19,7 @@
 import { onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import * as api from "../../api/lean";
 import { loadMonaco, monacoKeybinding, type MonacoApi } from "../../editor/monaco";
+import { texCompletion, texPrefix, texSuggestions } from "../../lib/lean-tex";
 
 /** A problem Lean reported, on the file's own line numbers. */
 export interface EditorMarker {
@@ -107,8 +108,9 @@ let rules: Disposable | null = null;
 const documents = new Map<string, TextDocument>();
 /** How many documents one editor keeps open: each holds its own undo history. */
 const KEEP_DOCUMENTS = 16;
-/** The completion provider belongs to Monaco, not to a pane: one for the app. */
+/** The completion providers belong to Monaco, not to a pane: one pair for the app. */
 let completionsRegistered = false;
+let texRegistered = false;
 
 /**
  * LSP `CompletionItemKind` → Monaco's, which numbers them differently.
@@ -170,6 +172,10 @@ onMounted(async () => {
     theme: "klean-dark",
     readOnly: props.readonly,
     automaticLayout: true,
+    // Tokenising is what colours the text; the two size guards Monaco applies at
+    // model construction (20 MB, 300 k lines) only ever bite on generated files, but
+    // a file that hits one would be grey for good — and the guard is not reversible.
+    largeFileOptimizations: false,
     fontFamily: font.family,
     fontSize: font.size,
     lineHeight: 18,
@@ -220,6 +226,8 @@ onMounted(async () => {
   applyKeys();
   applyMarkers();
   registerCompletions();
+  registerTexInput();
+  watchTexSpace(editorInstance);
   editorInstance.focus();
 });
 
@@ -386,6 +394,77 @@ function registerCompletions() {
 function docIdOf(uri: import("monaco-editor").Uri): string | null {
   if (uri.scheme !== "inmemory" || !uri.path.startsWith("/klean/")) return null;
   return decodeURIComponent(uri.path.slice("/klean/".length));
+}
+
+/**
+ * Lean's LaTeX-style input: `\all`, `\->`, `\alpha` — the way the Lean extension
+ * does it, and the way the editor did it before the rewrite.
+ *
+ * Two halves: typing `\` offers the list of symbols (filtered as the name is typed),
+ * and pressing space after a complete name replaces it with the symbol, so a name can
+ * also be typed straight through without looking at the list.
+ */
+function registerTexInput() {
+  const instance = monaco.value;
+  if (!instance || texRegistered) return;
+  texRegistered = true;
+  instance.languages.registerCompletionItemProvider("lean", {
+    triggerCharacters: ["\\"],
+    provideCompletionItems: (document, position) => {
+      const before = document.getLineContent(position.lineNumber).slice(0, position.column - 1);
+      const prefix = texPrefix(before);
+      if (!prefix) return { suggestions: [] };
+      const range = {
+        startLineNumber: position.lineNumber,
+        endLineNumber: position.lineNumber,
+        startColumn: prefix.start + 1,
+        endColumn: position.column,
+      };
+      return {
+        suggestions: texSuggestions(prefix.name).map((entry) => ({
+          // The list shows both the name and what it becomes.
+          label: { label: `\\${entry.name}`, description: entry.symbol },
+          filterText: `\\${entry.name}`,
+          insertText: entry.symbol,
+          detail: entry.name,
+          kind: 14 as import("monaco-editor").languages.CompletionItemKind,
+          range,
+        })),
+      };
+    },
+  });
+}
+
+/** `\name` + space becomes its symbol, keeping the space. */
+function watchTexSpace(instance: Editor) {
+  instance.onKeyDown((event) => {
+    const api_ = monaco.value;
+    if (!api_ || event.keyCode !== api_.KeyCode.Space) return;
+    if (instance.getOption(api_.editor.EditorOption.readOnly)) return;
+    const position = instance.getPosition();
+    const model_ = instance.getModel();
+    if (!position || !model_) return;
+    const line = model_.getLineContent(position.lineNumber).slice(0, position.column - 1);
+    const completion = texCompletion(line);
+    if (!completion) return;
+    // The space would otherwise go in after the name: take it, and type the symbol.
+    event.preventDefault();
+    event.stopPropagation();
+    const start = position.column - completion.name.length - 1;
+    const text = `${completion.symbol} `;
+    const caret = start + text.length;
+    instance.executeEdits(
+      "klean.tex",
+      [
+        {
+          range: new api_.Range(position.lineNumber, start, position.lineNumber, position.column),
+          text,
+          forceMoveMarkers: true,
+        },
+      ],
+      [new api_.Selection(position.lineNumber, caret, position.lineNumber, caret)],
+    );
+  });
 }
 
 watch(

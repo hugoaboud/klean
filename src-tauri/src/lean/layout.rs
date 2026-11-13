@@ -372,6 +372,72 @@ impl LayoutFile {
             positions.insert(key.clone(), [*x, *y]);
         }
     }
+
+    /// Gives a node that changed its name the place (and the theory) its old key had.
+    ///
+    /// A node's key stands for its name, so saving a rename would otherwise drop the
+    /// card the user had placed back into a free spot. Everything keyed by a term —
+    /// graph positions, the theory it was filed under, the link bends — follows it.
+    pub fn relink(&mut self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        for positions in self.positions.values_mut() {
+            if let Some(point) = positions.remove(old) {
+                positions.entry(new.to_string()).or_insert(point);
+            }
+        }
+        if let Some(theory) = self.assignments.remove(old) {
+            self.assignments.entry(new.to_string()).or_insert(theory);
+        }
+        for bends in self.bends.values_mut() {
+            let moved: Vec<(String, f64)> = bends
+                .iter()
+                .filter(|(key, _)| key.split("->").any(|part| part == old))
+                .map(|(key, value)| (key.replace(old, new), *value))
+                .collect();
+            for (key, value) in moved {
+                bends.insert(key, value);
+            }
+            bends.retain(|key, _| !key.split("->").any(|part| part == old));
+        }
+    }
+
+    /// Puts freshly written nodes next to the one they were typed beside.
+    ///
+    /// A node that appears because the user kept typing in an editor belongs with the
+    /// node they were editing, not in a corner: it takes a spot a step below and to
+    /// the right of it, in the same graph and the same theory.
+    pub fn spawn_near(&mut self, anchor: &str, keys: &[String]) {
+        if keys.is_empty() {
+            return;
+        }
+        let theory = self.assignments.get(anchor).cloned();
+        for (index, key) in keys.iter().enumerate() {
+            if key == anchor {
+                continue;
+            }
+            if let Some(theory) = &theory {
+                self.assignments.entry(key.clone()).or_insert(theory.clone());
+            }
+            let graphs: Vec<String> = self.positions.keys().cloned().collect();
+            for graph in graphs {
+                let Some(anchor_point) = self
+                    .positions
+                    .get(&graph)
+                    .and_then(|positions| positions.get(anchor).copied())
+                else {
+                    continue;
+                };
+                let positions = self.positions.entry(graph).or_default();
+                if positions.contains_key(key) {
+                    continue;
+                }
+                let step = (index as f64 + 1.0) * 46.0;
+                positions.insert(key.clone(), [anchor_point[0] + step, anchor_point[1] + step]);
+            }
+        }
+    }
 }
 
 /// Spiral out from `anchor` until a rectangle of `size` fits without touching.

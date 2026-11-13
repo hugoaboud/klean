@@ -11,8 +11,8 @@ use super::ast::{
     is_import, AstNode, Diagnostic, LineIndex, ParsedFile, Severity, Span,
 };
 use super::dto::{
-    CameraDto, DiagnosticDto, GraphLink, GraphNode, LogicGraph, NodeDetail, PreviewResult,
-    ProjectGraph, ProjectSummary, SettingNode, Stats, TreeNode, UpdateResult, WorkspaceView,
+    CameraDto, DiagnosticDto, GraphLink, GraphNode, LogicGraph, NodeDetail, ProjectGraph,
+    ProjectSummary, SettingNode, Stats, TreeNode, UpdateResult, WorkspaceView,
 };
 use super::engine::{Completion, Engine, LeanStatus, Parse};
 use super::error::{LeanError, LeanResult};
@@ -111,9 +111,6 @@ pub struct Project {
     fs: ProjectFs,
     libs: Vec<Lib>,
     cache: HashMap<String, Arc<CachedFile>>,
-    /// Files the editor has changed but not saved: the text as typed, so Lean can
-    /// check it. Nothing here is on disk, and nothing here outlives the editor.
-    drafts: HashMap<String, Arc<CachedFile>>,
     /// Graph nodes the user has expanded. Rust owns this so the UI stays dumb.
     expanded: HashSet<String>,
     graph_seeded: bool,
@@ -167,7 +164,6 @@ impl Project {
             fs,
             libs,
             cache: HashMap::new(),
-            drafts: HashMap::new(),
             expanded: HashSet::new(),
             graph_seeded: false,
             layout,
@@ -323,27 +319,14 @@ impl Project {
 
     /// Reads a file's tree, parsing it if needed.
     ///
-    /// `Exact` re-parses a tree that was only parsed for the board (core syntax),
-    /// which is what happens the first time a file is opened in the editor.
+    /// There is no such thing here as an unsaved *file*: an editor holds its text
+    /// until the user saves, and only then is anything written and re-read. That is
+    /// what keeps a node's range from ever disagreeing with the tree.
     fn load(&mut self, rel: &str, mode: Parse) -> LeanResult<Arc<CachedFile>> {
-        // An unsaved edit is what the user means by "this file" right now: Lean has
-        // been given it, so the tree, the diagnostics and the goals all read it.
-        // The server's answer keeps arriving, so the cell is refreshed on the way out
-        // — exactly as it is for a file on disk.
-        if let Some(draft) = self.drafts.get(rel) {
-            if mode == Parse::Tree || draft.exact {
-                *draft
-                    .diagnostics
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                    self.engine.diagnostics(rel);
-                return Ok(draft.clone());
-            }
-        }
         self.load_disk(rel, mode)
     }
 
-    /// The file as it is on disk, ignoring any unsaved edit.
+    /// The file as it is on disk.
     fn load_disk(&mut self, rel: &str, mode: Parse) -> LeanResult<Arc<CachedFile>> {
         let source = self.fs.read(rel)?;
         // While the background read is preparing Lean's parser, parsing would mean
@@ -1182,140 +1165,90 @@ impl Project {
 
     // ------------------------------------------------------------------ edit
 
-    /// Replaces the text of a node and writes the file back through the VFS.
-    pub fn update(&mut self, id: &str, text: &str) -> LeanResult<UpdateResult> {
-        let (rel, span) = match self.resolve(id)? {
-            Target::Ast { rel, path } => {
-                let cached = self.load(&rel, Parse::Tree)?;
-
-                let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
-                (rel, Some(node.inner))
-            }
-            Target::File(rel) | Target::AstGroup(rel) => (rel, None),
-            _ => {
-                return Err(LeanError::msg(
-                    "only file and declaration nodes can be edited",
-                ));
-            }
+    /// Writes one editor's text into its file, and only then re-reads anything.
+    ///
+    /// `linked` names the other nodes the same editor holds — text that grew a
+    /// second declaration covers both — so the range replaced runs from the first
+    /// node's start to the last one's end. The span comes from the tree of the file
+    /// as it is on disk, the same tree the ids were built from, so an edit replaces
+    /// the range the user was looking at.
+    pub fn update(
+        &mut self,
+        id: &str,
+        text: &str,
+        linked: &[String],
+    ) -> LeanResult<UpdateResult> {
+        let (rel, span) = self.range_of(id, linked)?;
+        // The keys the edited range holds now, so a renamed node keeps its place on
+        // the boards once its name has changed.
+        let before = match span {
+            Some(span) => self.keys_in(&rel, span),
+            None => Vec::new(),
         };
-        // The base is what is on screen: an unsaved edit is part of what is being
-        // saved, and splicing into the disk copy would throw it away.
-        let source = self.source_of(&rel)?;
+        let source = self.fs.read(&rel)?;
         let next = match span {
             Some(span) => splice(&source, span, text)?,
             None => text.to_string(),
         };
         self.fs.write(&rel, &next)?;
-        self.drafts.remove(&rel);
         self.cache.remove(&rel);
-        self.finish_edit(id, &rel)
+        // Where the new text sits: the range it replaced, carrying its new length.
+        let region = match span {
+            Some(span) => Span::new(span.start, span.start + text.len() as u32),
+            None => Span::new(0, next.len() as u32),
+        };
+        self.finish_edit(&rel, region, &before, id)
     }
 
-    /// Checks an edited declaration **without writing anything**.
-    ///
-    /// The text is spliced into the file as it stands (the draft, if there is one),
-    /// parsed, and handed to the language server straight away — which is what makes
-    /// typing feel immediate: Lean sees the change before the disk does. The answer
-    /// carries this node's detail and diagnostics only; the board's tree is left for
-    /// [`Project::update`], so a keystroke does not re-read the project.
-    pub fn preview(&mut self, id: &str, text: &str) -> LeanResult<PreviewResult> {
-        let (rel, span) = match self.resolve(id)? {
+    /// The file and the range an edit covers: the node itself, or the span from the
+    /// first linked node to the last.
+    fn range_of(&mut self, id: &str, linked: &[String]) -> LeanResult<(String, Option<Span>)> {
+        match self.resolve(id)? {
+            Target::File(rel) | Target::AstGroup(rel) => Ok((rel, None)),
             Target::Ast { rel, path } => {
                 let cached = self.load(&rel, Parse::Tree)?;
                 let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
-                (rel, Some(node.inner))
+                let mut span = node.inner;
+                for other in linked {
+                    if other == id {
+                        continue;
+                    }
+                    let Ok(Target::Ast {
+                        rel: other_rel,
+                        path: other_path,
+                    }) = self.resolve(other)
+                    else {
+                        continue;
+                    };
+                    if other_rel != rel {
+                        continue;
+                    }
+                    let cached = self.load(&other_rel, Parse::Tree)?;
+                    if let Some(node) = cached.parsed.get(&other_path) {
+                        span =
+                            Span::new(span.start.min(node.inner.start), span.end.max(node.inner.end));
+                    }
+                }
+                Ok((rel, Some(span)))
             }
-            Target::File(rel) | Target::AstGroup(rel) => (rel, None),
-            _ => return Err(LeanError::msg("only file and declaration nodes can be edited")),
-        };
-        let base = self.source_of(&rel)?;
-        let next = match span {
-            Some(span) => splice(&base, span, text)?,
-            None => text.to_string(),
-        };
-        self.hold_draft(&rel, next);
-        let detail = match self.detail(id) {
-            Ok(detail) => detail,
-            Err(_) => self.detail(&format!("file:{rel}"))?,
-        };
-        let diagnostics = self
-            .drafts
-            .get(&rel)
-            .map(|draft| draft.diagnostics())
-            .unwrap_or_default();
-        Ok(PreviewResult {
-            id: detail.id.clone(),
-            ok: !diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.severity == Severity::Error),
-            diagnostics: diagnostics_of(&diagnostics),
-            processing: self.engine.processing(),
-            detail,
-        })
-    }
-
-    /// Throws the unsaved edit away and puts the saved file back in front of Lean.
-    pub fn discard_draft(&mut self, id: &str) -> LeanResult<()> {
-        let rel = match self.resolve(id)? {
-            Target::Ast { rel, .. } | Target::File(rel) | Target::AstGroup(rel) => rel,
-            _ => return Err(LeanError::msg("only file and declaration nodes can be edited")),
-        };
-        if self.drafts.remove(&rel).is_none() {
-            return Ok(());
-        }
-        // The server is holding the draft: give it the saved text again, so what it
-        // reports is about what is on disk.
-        let saved = self.fs.read(&rel)?;
-        self.engine.sync(&rel, &saved);
-        if let Some(cached) = self.cache.get(&rel) {
-            *cached
-                .diagnostics
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.engine.diagnostics(&rel);
-        }
-        Ok(())
-    }
-
-    /// True when this node's file holds an unsaved edit.
-    pub fn has_draft(&self, id: &str) -> bool {
-        let rel = match self.resolve(id) {
-            Ok(Target::Ast { rel, .. } | Target::File(rel) | Target::AstGroup(rel)) => rel,
-            _ => return false,
-        };
-        self.drafts.contains_key(&rel)
-    }
-
-    /// The source an edit starts from: the unsaved text if there is one, the file
-    /// otherwise. A second keystroke must build on the first, not on the disk.
-    fn source_of(&mut self, rel: &str) -> LeanResult<String> {
-        match self.drafts.get(rel) {
-            Some(draft) => Ok(draft.source.clone()),
-            None => self.fs.read(rel),
+            _ => Err(LeanError::msg(
+                "only file and declaration nodes can be edited",
+            )),
         }
     }
 
-    /// Parses the edited text and gives it to the language server, holding it as the
-    /// draft for this file until it is saved or thrown away.
-    ///
-    /// The parse is the *core* one, like every other lookup: it is there to place the
-    /// nodes and the diagnostics, not to understand the project's notation — that is
-    /// the language server's job, and it takes the text whole.
-    fn hold_draft(&mut self, rel: &str, source: String) {
-        let parsed = self.parse_with_lean(rel, &source, Parse::Tree);
-        let draft = Arc::new(CachedFile {
-            rel: rel.to_string(),
-            hash: content_hash(&source),
-            lines: LineIndex::new(&source),
-            source,
-            parsed,
-            // Whatever the server last said, which its next answer will replace.
-            diagnostics: std::sync::Mutex::new(self.engine.diagnostics(rel)),
-            exact: true,
-        });
-        // Straight to Lean: the whole point is that checking does not wait for a
-        // write, and the diagnostics come back while the user is still typing.
-        self.engine.sync(rel, &draft.source);
-        self.drafts.insert(rel.to_string(), draft);
+    /// The term keys of the declaration nodes inside a range, before it is rewritten.
+    fn keys_in(&mut self, rel: &str, span: Span) -> Vec<String> {
+        let Ok(cached) = self.load(rel, Parse::Tree) else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        term_nodes(&cached.parsed.nodes, "", &[], rel, &mut found);
+        found
+            .into_iter()
+            .filter(|node| node.span.start >= span.start && node.span.start < span.end)
+            .map(|node| node.key)
+            .collect()
     }
 
     /// Rewrites the plain (`--`) comments sitting above a node.
@@ -1339,9 +1272,9 @@ impl Project {
         };
         let _ = comment_span;
 
-        // The spans come from the file as the editor has it, so the text they are
-        // spliced into must be the same text — the draft, when there is one.
-        let source = self.source_of(&rel)?;
+        // The spans come from the tree of the file on disk, so the text they are
+        // spliced into is that same text.
+        let source = self.fs.read(&rel)?;
         // Notes are written as `--` lines, one per line, wrapped so that no line
         // runs past the width a comment stays readable at. Markers pasted in are
         // stripped first, since the editor edits plain text.
@@ -1369,9 +1302,12 @@ impl Project {
             &source[node_start as usize..]
         );
         self.fs.write(&rel, &next)?;
-        self.drafts.remove(&rel);
         self.cache.remove(&rel);
-        self.finish_edit(id, &rel)
+        // The edit landed above the node: the node keeps its key, so its place is
+        // where the user put it.
+        let region = Span::new(region_start, region_start + replacement.len() as u32);
+        let before = self.keys_in(&rel, Span::new(node_start, node_start + 1));
+        self.finish_edit(&rel, region, &before, id)
     }
 
     /// Renames the declared name of a node, rewriting only that token.
@@ -1394,15 +1330,32 @@ impl Project {
             }
             _ => return Err(LeanError::msg("this node cannot be renamed")),
         };
-        let source = self.source_of(&rel)?;
+        let before = self.keys_in(&rel, span);
+        let source = self.fs.read(&rel)?;
         let next = splice(&source, span, trimmed)?;
         self.fs.write(&rel, &next)?;
-        self.drafts.remove(&rel);
         self.cache.remove(&rel);
-        self.finish_edit(id, &rel)
+        self.finish_edit(
+            &rel,
+            Span::new(span.start, span.start + trimmed.len() as u32),
+            &before,
+            id,
+        )
     }
 
-    fn finish_edit(&mut self, requested: &str, rel: &str) -> LeanResult<UpdateResult> {
+    /// Re-reads the file after an edit and reports what it now holds.
+    ///
+    /// This is the one place the boards see a change: the file was just written, so
+    /// the tree is re-parsed, every node of it gets its range again, and the editors
+    /// of that file are told what their text is now — which node they are, and which
+    /// nodes came along with it.
+    fn finish_edit(
+        &mut self,
+        rel: &str,
+        region: Span,
+        before: &[String],
+        requested: &str,
+    ) -> LeanResult<UpdateResult> {
         // The file changed: hand the new text to the language server, which
         // re-checks it (and only it) in the background.
         let _ = self.check_file(rel);
@@ -1410,10 +1363,47 @@ impl Project {
         // `load` has already handed the new text to the server; the diagnostics
         // it answers with arrive in the background, and the UI polls for them.
         let diagnostics = cached.diagnostics();
+
+        // The declarations the saved range covers now: one, or several when the
+        // editor grew a second node.
+        let mut found = Vec::new();
+        term_nodes(&cached.parsed.nodes, "", &[], rel, &mut found);
+        let inside: Vec<&TermNode> = found
+            .iter()
+            .filter(|node| node.span.start >= region.start && node.span.start < region.end.max(region.start + 1))
+            .collect();
+        let mut nodes: Vec<String> = found
+            .iter()
+            .filter(|node| node.span.start >= region.start && node.span.start < region.end.max(region.start + 1))
+            .map(|node| node.id.clone())
+            .collect();
+        if !nodes.iter().any(|id| id == requested) {
+            nodes.insert(0, requested.to_string());
+        }
+
+        // A node saved under a new name keeps its place on the boards, and the nodes
+        // that appeared with it land beside it instead of in a fresh corner.
+        let primary = inside
+            .first()
+            .map(|node| node.key.clone())
+            .or_else(|| before.first().cloned());
+        if let Some(primary) = primary {
+            if let Some(old) = before.first() {
+                self.layout.relink(old, &primary);
+            }
+            let added: Vec<String> = inside
+                .iter()
+                .map(|node| node.key.clone())
+                .filter(|key| Some(key) != before.first())
+                .collect();
+            self.layout.spawn_near(&primary, &added);
+        }
+
         let detail = match self.detail(requested) {
             Ok(detail) => detail,
             Err(_) => self.detail(&format!("file:{rel}"))?,
         };
+        let text = region.slice(&cached.source).to_string();
         let view = self.view()?;
         let ok = !diagnostics
             .iter()
@@ -1426,6 +1416,8 @@ impl Project {
             diagnostics: diagnostics_of(&diagnostics),
             ok,
             processing: self.engine.processing(),
+            nodes,
+            text,
         })
     }
 
@@ -2127,13 +2119,7 @@ fn collect_terms(
             continue;
         }
 
-        let kind = match node.kind.as_str() {
-            "structure" | "class" => Some("structure"),
-            "axiom" => Some("axiom"),
-            "def" | "abbrev" | "opaque" => Some("def"),
-            "theorem" | "lemma" => Some("theorem"),
-            _ => None,
-        };
+        let kind = term_kind(node);
         let Some(kind) = kind else {
             if !node.children.is_empty() {
                 collect_terms(
@@ -2177,6 +2163,62 @@ fn node_key(kind: &str, rel: &str, name: Option<&str>, fallback: u32) -> String 
     match name {
         Some(name) if !name.is_empty() => format!("{kind}:{name}@{rel}"),
         _ => format!("{kind}@{fallback}@{rel}"),
+    }
+}
+
+/// The board's kind for a declaration.
+///
+/// Every declaration a file's tree holds is a row of the logic tree — axioms,
+/// inductive types, instances and the syntax commands included. There is no list of
+/// "interesting" kinds here on purpose: filtering was what made a file look like it
+/// held fewer declarations than it does.
+fn term_kind(node: &AstNode) -> Option<&'static str> {
+    Some(match node.kind.as_str() {
+        "def" | "abbrev" | "opaque" => "def",
+        "theorem" | "lemma" => "theorem",
+        "structure" | "class" => "structure",
+        "inductive" => "inductive",
+        "instance" => "instance",
+        "axiom" => "axiom",
+        "example" => "example",
+        "syntax" | "macro" | "macro_rules" | "notation" | "elab" => "syntax",
+        _ => return None,
+    })
+}
+
+/// One declaration of a file, as the walking helpers need it: where it is and how
+/// the boards name it.
+struct TermNode {
+    id: String,
+    key: String,
+    span: Span,
+}
+
+/// Every declaration in a file's tree, with the id and key the boards give it.
+fn term_nodes(nodes: &[AstNode], prefix: &str, path: &[usize], rel: &str, out: &mut Vec<TermNode>) {
+    for (index, node) in nodes.iter().enumerate() {
+        let mut child_path = path.to_vec();
+        child_path.push(index);
+        let next = if node.kind == "namespace" {
+            join_name(prefix, &node.name.clone().unwrap_or_default())
+        } else {
+            prefix.to_string()
+        };
+        if let Some(kind) = term_kind(node) {
+            let name = node
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{kind}@{}", node.span.start));
+            let qual = join_name(prefix, &name);
+            out.push(TermNode {
+                id: format!("ast:{}#{}", rel, join_path(&child_path)),
+                key: node_key(kind, rel, Some(&qual), node.span.start),
+                span: node.inner,
+            });
+        }
+        if !node.children.is_empty() {
+            term_nodes(&node.children, &next, &child_path, rel, out);
+        }
     }
 }
 
@@ -2916,7 +2958,9 @@ theorem todo : two = 3 := by sorry
         assert!(project.lean_status().server, "the language server is running");
 
         // Editing splices exactly the node's span and writes the file back.
-        let result = project.update(&id, "def two : Nat := 1 + 1").expect("update");
+        let result = project
+            .update(&id, "def two : Nat := 1 + 1", &[])
+            .expect("update");
         assert_eq!(result.detail.text, "def two : Nat := 1 + 1");
         let source = std::fs::read_to_string(root.join("Demo/Basic.lean")).expect("file");
         assert!(source.contains("def two : Nat := 1 + 1"));
@@ -2990,12 +3034,11 @@ mod editor_tests {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
-    /// A preview checks the text Lean has, not the file on disk: nothing is written,
-    /// the draft is what the tree and the diagnostics read, and discarding it puts
-    /// the saved file back in front of Lean.
+    /// A save is the only thing that writes, and it rewrites just the range it came
+    /// from: reading a node never touches the file.
     #[test]
-    fn a_preview_checks_in_memory_and_leaves_the_disk_alone() {
-        let root = scratch("preview");
+    fn a_save_writes_only_its_own_range() {
+        let root = scratch("save-range");
         let path = root.join("Demo/Basic.lean");
         let mut project = match Project::open(&root, std::env::temp_dir().join("klean-test-appdata"))
         {
@@ -3006,8 +3049,6 @@ mod editor_tests {
             }
         };
         project.view().expect("view");
-        project.check_file("Demo/Basic.lean").expect("check");
-        settle(&mut project);
         let before = std::fs::read_to_string(&path).expect("file");
         let id = project
             .view()
@@ -3019,50 +3060,147 @@ mod editor_tests {
             .map(|node| node.id)
             .expect("the definition");
 
-        // An edit Lean cannot accept: it has to be *reported*, which means Lean was
-        // given the text.
-        let preview = project
-            .preview(&id, "def two : Nat := missingTerm")
-            .expect("preview");
-        assert_eq!(preview.detail.text.trim(), "def two : Nat := missingTerm");
-        assert!(project.has_draft(&id), "the edit is held as a draft");
-        settle(&mut project);
-        let checked = project.detail(&id).expect("detail");
-        assert!(
-            checked
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.severity == "error"),
-            "Lean checked the typed text: {:?}",
-            checked.diagnostics
-        );
-        // The disk never saw it.
+        // Opening an editor reads the node and writes nothing.
+        let detail = project.detail(&id).expect("detail");
+        assert_eq!(detail.text.trim(), "def two : Nat := 2");
         assert_eq!(
             std::fs::read_to_string(&path).expect("file"),
             before,
-            "a preview writes nothing"
+            "nothing is written before a save"
         );
 
-        // Discarding gives Lean the saved file back.
-        project.discard_draft(&id).expect("discard");
-        assert!(!project.has_draft(&id));
-        settle(&mut project);
-        let restored = project.detail(&id).expect("detail");
-        assert!(restored.text.contains("def two : Nat := 2"), "{}", restored.text);
-        assert!(
-            restored
-                .diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.severity != "error"),
-            "{:?}",
-            restored.diagnostics
-        );
-
-        // Saving is the one path that writes.
-        project.update(&id, "def two : Nat := 3").expect("save");
+        // The save replaces the node's own range; the declaration after it stays.
+        let saved = project
+            .update(&id, "def two : Nat := 3", &[])
+            .expect("save");
+        assert_eq!(saved.detail.text.trim(), "def two : Nat := 3");
+        assert_eq!(saved.nodes, vec![id.clone()], "one node, the one saved");
+        assert_eq!(saved.text.trim(), "def two : Nat := 3");
         let after = std::fs::read_to_string(&path).expect("file");
         assert!(after.contains("def two : Nat := 3"), "{after}");
-        assert!(!project.has_draft(&id), "a save ends the draft");
+        assert!(
+            after.contains("theorem t : two = 2 := rfl"),
+            "the next declaration is untouched: {after}"
+        );
+        assert_eq!(after.matches("def two").count(), 1, "no duplicated text: {after}");
+    }
+
+    /// Text that grew a second declaration is one document linked to two nodes, and
+    /// saving it again replaces the range exactly once.
+    #[test]
+    fn a_saved_edit_can_hold_two_nodes() {
+        let root = scratch("two-nodes");
+        let path = root.join("Demo/Basic.lean");
+        let mut project = match Project::open(&root, std::env::temp_dir().join("klean-test-appdata"))
+        {
+            Ok(project) => project,
+            Err(error) => {
+                eprintln!("cannot open the project without Lean: {error}");
+                return;
+            }
+        };
+        project.view().expect("view");
+        let id = project
+            .view()
+            .expect("view")
+            .tree
+            .first()
+            .and_then(|lib| super::tests::find_file(lib, "Demo/Basic.lean"))
+            .and_then(|file| file.children.first().cloned())
+            .map(|node| node.id)
+            .expect("the definition");
+
+        // The user kept typing below the declaration and wrote a second one.
+        let longer = "def two : Nat := 2\n\ndef two_sum : Nat := two + two";
+        let saved = project.update(&id, longer, &[]).expect("save");
+        assert_eq!(
+            saved.nodes.len(),
+            2,
+            "both declarations belong to the editor: {:?}",
+            saved.nodes
+        );
+        assert!(saved.text.contains("two_sum"), "{}", saved.text);
+
+        // Saving again carries both: the range starts at the first and ends at the
+        // last, so the text is replaced once and not appended twice.
+        let again = project
+            .update(&id, "def two : Nat := 2\n\ndef two_sum : Nat := two + 3", &saved.nodes)
+            .expect("save again");
+        assert_eq!(again.nodes.len(), 2);
+        let source = std::fs::read_to_string(&path).expect("file");
+        assert!(source.contains("two_sum : Nat := two + 3"), "{source}");
+        assert_eq!(
+            source.matches("def two_sum").count(),
+            1,
+            "the edit replaced the range instead of adding to it: {source}"
+        );
+        assert!(
+            source.contains("theorem t : two = 2 := rfl"),
+            "the rest of the file is untouched: {source}"
+        );
+    }
+
+    /// A node saved under a new name keeps the place and the theory it had.
+    #[test]
+    fn saving_a_rename_keeps_the_nodes_place() {
+        let root = scratch("rename-place");
+        let mut project = match Project::open(&root, std::env::temp_dir().join("klean-test-appdata"))
+        {
+            Ok(project) => project,
+            Err(error) => {
+                eprintln!("cannot open the project without Lean: {error}");
+                return;
+            }
+        };
+        project.view().expect("view");
+        let id = project
+            .view()
+            .expect("view")
+            .tree
+            .first()
+            .and_then(|lib| super::tests::find_file(lib, "Demo/Basic.lean"))
+            .and_then(|file| file.children.first().cloned())
+            .map(|node| node.id)
+            .expect("the definition");
+        let old_key = "def:two@Demo/Basic.lean";
+        // A theory, so the node has a graph of its own to be placed in.
+        let theory_graph = project.create_theory(None, "Numbers").expect("theory");
+        let theory = theory_graph
+            .nodes
+            .iter()
+            .find(|node| node.label == "Numbers")
+            .map(|node| node.key.clone())
+            .expect("the theory key");
+        // Filed into the theory, and placed by hand where the user put it.
+        project
+            .assign_theory(None, &[id.clone()], Some(&theory))
+            .expect("assign");
+        // The theory's own graph, which is where its terms are drawn.
+        let graph_key = project
+            .logic_graph(Some(&theory))
+            .expect("theory graph")
+            .graph;
+        project
+            .save_positions(&graph_key, &[(old_key.to_string(), 40.0, 60.0)])
+            .expect("positions");
+
+        // The rename arrives as text, the way the editor sends it.
+        let detail = project.detail(&id).expect("detail");
+        let renamed = detail.text.replace("def two", "def three");
+        let saved = project.update(&id, &renamed, &[]).expect("save");
+        assert_eq!(saved.detail.name.as_deref(), Some("three"));
+
+        let graph = project.logic_graph(Some(&theory)).expect("logic");
+        let node = graph
+            .nodes
+            .iter()
+            .find(|node| node.label == "three")
+            .expect("the renamed node is on the board");
+        assert_eq!(
+            (node.x, node.y),
+            (40.0, 60.0),
+            "it keeps the place the user gave it"
+        );
     }
 
     /// Opening a project is a filesystem walk, nothing more: the declarations are
@@ -3111,8 +3249,8 @@ mod editor_tests {
             .expect("project");
         project
             .save_settings(&[
-                ("editor.check_debounce".to_string(), "450".to_string()),
                 ("editor.keys.find".to_string(), "Ctrl+Alt+F".to_string()),
+                ("editor.keys.close".to_string(), "Ctrl+Shift+W".to_string()),
                 ("ai.customize.system_prompt".to_string(), "Answer in French.".to_string()),
             ])
             .expect("save");
@@ -3131,61 +3269,12 @@ mod editor_tests {
             }
             walk(&project.settings_tree(), id)
         };
-        assert_eq!(value("editor.check_debounce").as_deref(), Some("450"));
+        assert_eq!(value("editor.keys.close").as_deref(), Some("Ctrl+Shift+W"));
         assert_eq!(value("editor.keys.find").as_deref(), Some("Ctrl+Alt+F"));
         assert_eq!(
             value("ai.customize.system_prompt").as_deref(),
             Some("Answer in French.")
         );
-    }
-
-    /// A file's edited text lives in one place: a node editor and the file editor of
-    /// the same file read the same memory, which is what keeps two modals in sync.
-    #[test]
-    fn the_file_document_is_shared_between_its_editors() {
-        let root = scratch("shared");
-        let mut project = Project::open(&root, std::env::temp_dir().join("klean-test-appdata"))
-            .expect("project");
-        project.view().expect("view");
-        let def = project
-            .view()
-            .expect("view")
-            .tree
-            .first()
-            .and_then(|lib| super::tests::find_file(lib, "Demo/Basic.lean"))
-            .and_then(|file| file.children.first().cloned())
-            .map(|node| node.id)
-            .expect("the definition");
-
-        // Typed in the node's editor: the file's editor already holds it.
-        project
-            .preview(&def, "def two : Nat := 42")
-            .expect("preview the node");
-        let file = project.detail("file:Demo/Basic.lean").expect("file detail");
-        assert!(
-            file.text.contains("def two : Nat := 42"),
-            "the node's edit is part of the file: {}",
-            file.text
-        );
-
-        // Typed in the file's editor: the node's editor already holds it.
-        let whole = file.text.replace("Nat := 42", "Nat := 43");
-        project
-            .preview("file:Demo/Basic.lean", &whole)
-            .expect("preview the file");
-        let node = project.detail(&def).expect("detail");
-        assert!(
-            node.text.contains("43"),
-            "the file's edit reaches the node: {}",
-            node.text
-        );
-
-        // Discarding drops the memory for all of them.
-        project.discard_draft(&def).expect("discard");
-        let node = project.detail(&def).expect("detail");
-        assert!(node.text.contains(":= 2"), "back to the disk: {}", node.text);
-        let file = project.detail("file:Demo/Basic.lean").expect("file detail");
-        assert!(!file.text.contains("42"), "the file reverts too: {}", file.text);
     }
 
     /// Typing a term Lean does not know has to show up as an error in the editor.
@@ -3221,7 +3310,7 @@ mod editor_tests {
 
         // Now use a term that does not exist.
         project
-            .update(&def, "def two : Nat := missingTerm")
+            .update(&def, "def two : Nat := missingTerm", &[])
             .expect("update");
         settle(&mut project);
 

@@ -130,6 +130,13 @@ export interface UpdateResult {
   ok: boolean;
   /** True while the language server is still checking the file. */
   processing: boolean;
+  /**
+   * Every declaration the saved text now holds, in file order. More than one when
+   * the editor grew another node: the pane is linked to all of them.
+   */
+  nodes: string[];
+  /** The saved text as the file reads between those nodes. */
+  text: string;
 }
 
 /** How the pre-welcome warm-up stands (Lean's parser, mostly). */
@@ -176,11 +183,9 @@ export const focusGraphNode = (id: string) =>
 
 export const nodeDetail = (id: string) => invoke<NodeDetail>("node_detail", { id });
 
-export const updateNode = (id: string, text: string) =>
-  invoke<UpdateResult>("update_node", { id, text });
-
-export const renameNode = (id: string, name: string) =>
-  invoke<UpdateResult>("rename_node", { id, name });
+/** Writes an editor's text into its file; `linked` are the nodes it also covers. */
+export const updateNode = (id: string, text: string, linked: string[] = []) =>
+  invoke<UpdateResult>("update_node", { id, text, linked });
 
 export const exportZipData = () => invoke<string>("export_zip_data");
 
@@ -192,13 +197,8 @@ export const exportOutline = () => invoke<string>("export_outline");
 export const exportOutlineTo = (path: string) =>
   invoke<string>("export_outline_to", { path });
 
-export const printFile = (id: string) => invoke<string>("print_file", { id });
-
 /** Removes a declaration from the file it lives in. */
 export const deleteNode = (id: string) => invoke<void>("delete_node", { id });
-
-/** The file a node lives in, exactly as it is on disk. */
-export const fileSource = (id: string) => invoke<string>("file_source", { id });
 
 /** One step of the logic breadcrumbs: the root graph, or a theory. */
 export interface TheoryRef {
@@ -405,27 +405,6 @@ export const leanScanState = () => invoke<ScanState>("scan_state");
 /** Stops the background read. */
 export const leanScanCancel = () => invoke<void>("scan_cancel");
 
-/**
- * The answer to a keystroke: the node as it now reads and what Lean says about it.
- * Nothing is written to disk.
- */
-export interface PreviewResult {
-  id: string;
-  detail: NodeDetail;
-  diagnostics: DiagnosticDto[];
-  /** True when Lean reported no errors for the edited file. */
-  ok: boolean;
-  /** True while the server is still checking: ask again shortly. */
-  processing: boolean;
-}
-
-/** Checks an edited node without saving it; the text goes to Lean at once. */
-export const previewNode = (id: string, text: string) =>
-  invoke<PreviewResult>("preview_node", { id, text });
-
-/** Throws an unsaved edit away and re-checks the file as it is on disk. */
-export const discardDraft = (id: string) => invoke<void>("discard_draft", { id });
-
 /** Starts `lake build` in the background and returns immediately. */
 export const leanBuild = () => invoke<BuildState>("lean_build");
 
@@ -458,6 +437,16 @@ export interface Completion {
 /** What Lean offers to complete at a position inside a node's text. */
 export const leanCompletions = (id: string, line: number, character: number) =>
   invoke<Completion[]>("lean_completions", { id, line, character });
+
+/**
+ * `#check` on the text, with the whole project in scope.
+ *
+ * The Rust side is the AI's `lean_check` tool — the same plan, the same run — so the
+ * answer is what that tool returns: Lean's own lines, errors prefixed `error:`.
+ * Lean runs outside the project lock, so this can take the seconds `lake` would.
+ */
+export const checkProject = (expression: string) =>
+  invoke<string>("check_project", { text: expression });
 
 /** Downloads elan + the configured channel; resolves with the `lean` path. */
 export const leanInstall = () => invoke<string>("lean_install");

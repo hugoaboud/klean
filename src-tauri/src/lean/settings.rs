@@ -337,12 +337,6 @@ pub fn tree(values: &BTreeMap<String, String>) -> Vec<SettingNode> {
         "Editor",
         "How the node editor behaves while you type.",
         vec![
-            SettingNode::text(
-                "editor.check_debounce",
-                "Check Debounce (ms)",
-                &get("editor.check_debounce", "300"),
-                "How long typing has to pause before Lean is asked about the node. The whole node is re-checked once, from memory — no file is written.",
-            ),
             SettingNode::group(
                 "editor.keys",
                 "Keyboard Shortcuts",

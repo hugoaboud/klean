@@ -286,7 +286,7 @@ function mount() {
       return mouse.type === "mousedown" && pans(mouse);
     })
     .on("zoom", (event) => {
-      root?.attr("transform", event.transform.toString());
+      applyTransform(event.transform);
       scheduleCamera();
     });
   svg.call(zoom).on("dblclick.zoom", null);
@@ -879,10 +879,23 @@ function release(event: PointerEvent, node: SimNode) {
   emit("pick", node.id, additive);
 }
 
+/**
+ * Where a pointer event lands in graph coordinates.
+ *
+ * Read from the zoom transform rather than through the SVG's screen matrix: the view
+ * is moved with a CSS transform (see `applyTransform`), and this is both independent
+ * of how it was applied and cheaper than asking the browser for a matrix on every
+ * pointer move.
+ */
 function pointerInGraph(event: PointerEvent | MouseEvent): { x: number; y: number } | null {
-  if (!root?.node()) return null;
-  const point = d3.pointer(event, root.node());
-  return { x: point[0], y: point[1] };
+  const element = svg?.node();
+  if (!element) return null;
+  const rect = element.getBoundingClientRect();
+  const transform = d3.zoomTransform(element);
+  return {
+    x: (event.clientX - rect.left - transform.x) / transform.k,
+    y: (event.clientY - rect.top - transform.y) / transform.k,
+  };
 }
 
 function onBackgroundDown(event: PointerEvent) {
@@ -957,6 +970,33 @@ let bandRect: d3.Selection<SVGRectElement, unknown, null, undefined> | null = nu
 /** Camera changes are published at most a few times a second. */
 let cameraTimer: number | null = null;
 
+/**
+ * The view transform, applied as a CSS transform once per animation frame.
+ *
+ * A wheel tick arrives as several zoom events, and writing an SVG `transform`
+ * attribute for each one makes the browser lay the whole graph out again — every
+ * node, every link, every label — which is what made zooming stutter and spike the
+ * CPU on a large board. A CSS transform is composited instead: the browser moves the
+ * picture it already has. Coalescing to one frame keeps a fast wheel from queueing
+ * dozens of them.
+ */
+let zoomFrame = 0;
+let zoomPending: d3.ZoomTransform | null = null;
+
+function applyTransform(transform: d3.ZoomTransform) {
+  zoomPending = transform;
+  if (zoomFrame !== 0) return;
+  zoomFrame = window.requestAnimationFrame(() => {
+    zoomFrame = 0;
+    const next = zoomPending;
+    zoomPending = null;
+    if (!next || !root) return;
+    root.attr("transform", null);
+    root.style("transform-origin", "0 0");
+    root.style("transform", `translate(${next.x}px, ${next.y}px) scale(${next.k})`);
+  });
+}
+
 function scheduleCamera() {
   if (cameraTimer !== null) return;
   cameraTimer = window.setTimeout(() => {
@@ -1009,6 +1049,8 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   observer?.disconnect();
+  if (zoomFrame !== 0) window.cancelAnimationFrame(zoomFrame);
+  zoomFrame = 0;
   svg?.remove();
   svg = null;
   root = null;
@@ -1096,6 +1138,12 @@ watch(
 </template>
 
 <style scoped>
+/* The zoom layer keeps its own compositing layer: moving it is then a transform of
+   a picture the browser already has, not a re-layout of every node and link. */
+.graph :deep(.graph__root) {
+  will-change: transform;
+}
+
 .graph {
   position: relative;
   flex: 1;

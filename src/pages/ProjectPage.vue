@@ -17,6 +17,7 @@ import UiSplitPane from "../components/ui/UiSplitPane.vue";
 import LogicPage from "./LogicPage.vue";
 import SettingsModal from "../components/SettingsModal.vue";
 import AiModal from "../components/AiModal.vue";
+import CheckModal from "../components/CheckModal.vue";
 import { matchesShortcut } from "../editor/keys";
 import { aiActions, aiState } from "../store/ai";
 import {
@@ -25,7 +26,6 @@ import {
   aiEnabled,
   buildPrompt,
   canBuild,
-  checkDebounce,
   closeKey,
   editorKeys,
   isLocked,
@@ -43,6 +43,17 @@ const deleteOpen = ref(false);
 const deleteTarget = ref("");
 
 const isLogic = computed(() => state.boardView === "logic");
+
+/**
+ * The `#check` modal lives on the page, not in the store: there is one of it, and
+ * opening it is not a workspace change. It sits beside the AI modal rather than
+ * replacing it — one of each, and the button that opened one closes it again.
+ */
+const checkOpen = ref(false);
+
+function toggleCheck() {
+  checkOpen.value = !checkOpen.value;
+}
 
 // The question belongs to a project, not to the app: ask when one appears.
 watch(
@@ -161,7 +172,6 @@ function paneProcessing(pane: EditorPane) {
 }
 
 /** The editor's settings, as the settings page spells them. */
-const debounce = computed(() => checkDebounce());
 const keys = computed(() => editorKeys());
 
 /** Double-click on a node: another modal when the modifier is held. */
@@ -324,9 +334,21 @@ async function copyPrinted() {
         <UiButton
           size="sm"
           variant="ghost"
+          class="board__check"
+          title="#check with the whole project in scope"
+          :active="checkOpen"
+          @click="toggleCheck()"
+        >
+          <span class="board__check-glyph" aria-hidden="true">∀</span>
+          Check
+        </UiButton>
+        <UiButton
+          size="sm"
+          variant="ghost"
           class="board__ai"
-          title="AI sessions"
-          @click="aiActions.show()"
+          :title="aiState.open ? 'Close the AI panel' : 'AI sessions'"
+          :active="aiState.open"
+          @click="aiState.open ? aiActions.hide() : aiActions.show()"
         >
           <UiIcon name="ai" :size="12" />
           AI
@@ -458,6 +480,7 @@ async function copyPrinted() {
     <UiSnackbar :mode="state.boardView" @change="actions.setBoardView($event)" />
 
     <AiModal />
+    <CheckModal :open="checkOpen" @close="checkOpen = false" />
 
     <!-- One modal per open node: Ctrl+double-click opens another, a plain
          double-click retargets the one the user last touched. -->
@@ -500,14 +523,12 @@ async function copyPrinted() {
         :locked="isLocked(pane)"
         :busy="slowBusy"
         :processing="paneProcessing(pane)"
-        :debounce="debounce"
         :loading="pane.loading"
         :keys="keys"
-        @preview="(text: string) => actions.previewText(pane.id, text)"
         @save="(text: string) => actions.applyText(pane.id, text)"
         @dirty="(value: boolean) => actions.setPaneDirty(pane.id, value)"
         @selections="(count: number) => actions.setPaneSelections(pane.id, count)"
-        @revert="actions.discardPane(pane.id)"
+        @revert="actions.revertPane(pane.id)"
         @comments="(text: string) => actions.applyComments(pane.id, text)"
         @prompt="askAboutNode"
         @refresh-goals="void actions.loadPaneGoals(pane.id)"
@@ -809,8 +830,16 @@ async function copyPrinted() {
   gap: 4px;
 }
 
-.board__ai {
+.board__ai,
+.board__check {
   gap: 4px;
+}
+
+/* The ∀ of the check button, at the size the icons around it are. */
+.board__check-glyph {
+  font-size: 13px;
+  line-height: 1;
+  color: var(--fg-2);
 }
 
 .board__ai-dot {

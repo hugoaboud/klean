@@ -12,9 +12,8 @@ use crate::lean::build::BuildState;
 use crate::lean::lsp::Goals;
 use crate::lean::scan::{Scan, ScanState};
 use crate::lean::{
-    Completion, FixedNode, LeanStatus, LogicGraph, NodeDetail, PreviewResult, Project,
-    ProjectGraph, ProjectSummary, RecentProject, Recents, SettingNode, UpdateResult,
-    WorkspaceView,
+    Completion, FixedNode, LeanStatus, LogicGraph, NodeDetail, Project, ProjectGraph,
+    ProjectSummary, RecentProject, Recents, SettingNode, UpdateResult, WorkspaceView,
 };
 
 /// Holds the currently open project and the recently opened list. One workspace
@@ -333,25 +332,13 @@ pub fn update_node(
     state: State<'_, AppState>,
     id: String,
     text: String,
+    linked: Option<Vec<String>>,
 ) -> Result<UpdateResult, String> {
-    with_project(&state, |project| project.update(&id, &text).map_err(message))
-}
-
-/// Checks an edited node **without writing it**: the text goes to Lean at once, so
-/// diagnostics arrive while the user is still typing.
-#[tauri::command(async)]
-pub fn preview_node(
-    state: State<'_, AppState>,
-    id: String,
-    text: String,
-) -> Result<PreviewResult, String> {
-    with_project(&state, |project| project.preview(&id, &text).map_err(message))
-}
-
-/// Throws an unsaved edit away and re-checks the file as it is on disk.
-#[tauri::command(async)]
-pub fn discard_draft(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    with_project(&state, |project| project.discard_draft(&id).map_err(message))
+    with_project(&state, |project| {
+        project
+            .update(&id, &text, linked.as_deref().unwrap_or(&[]))
+            .map_err(message)
+    })
 }
 
 /// The settings tree, with the project's values applied.
@@ -686,6 +673,22 @@ pub fn lean_build_cancel(state: State<'_, AppState>) -> Result<BuildState, Strin
         project.cancel_build();
         Ok(project.lean_build_state())
     })
+}
+
+/// `#check` on the text the user typed, with the whole project in scope.
+///
+/// This is the AI's `lean_check` tool, reached from a button: the same plan from
+/// `Project::check_plan` (built modules imported, gathered under the project lock),
+/// then the same `check::run`, outside the lock so the board stays usable while
+/// Lean thinks. There is one implementation of "check something", not two.
+#[tauri::command(async)]
+pub fn check_project(state: State<'_, AppState>, text: String) -> Result<String, String> {
+    let expression = text.trim();
+    if expression.is_empty() {
+        return Ok(String::new());
+    }
+    let plan = with_project(&state, |project| project.check_plan().map_err(message))?;
+    crate::lean::check::run(plan, expression)
 }
 
 /// Asks the language server to check one file, in the background.

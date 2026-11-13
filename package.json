@@ -3,14 +3,14 @@
   "author": "Hugo Aboud",
   "license": "MIT",
   "private": true,
-  "version": "1.2.5",
+  "version": "1.2.7",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test": "node --test src/editor/*.test.ts"
+    "test": "node --test src/editor/*.test.ts src/lib/*.test.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
