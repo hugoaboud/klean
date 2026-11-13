@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Project shell: AST board (graph + tree) or Logic board, with the shared editor
 // modal and the bottom view switcher.
-import { computed, nextTick, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import GraphCanvas from "../components/GraphCanvas.vue";
 import LeanTreePanel from "../components/LeanTreePanel.vue";
@@ -17,8 +17,23 @@ import UiSplitPane from "../components/ui/UiSplitPane.vue";
 import LogicPage from "./LogicPage.vue";
 import SettingsModal from "../components/SettingsModal.vue";
 import AiModal from "../components/AiModal.vue";
+import { matchesShortcut } from "../editor/keys";
 import { aiActions, aiState } from "../store/ai";
-import { actions, aiEnabled, buildPrompt, canBuild, state } from "../store/workspace";
+import {
+  actions,
+  activePane,
+  aiEnabled,
+  buildPrompt,
+  canBuild,
+  checkDebounce,
+  closeKey,
+  editorKeys,
+  isLocked,
+  newEditorKey,
+  panKey,
+  state,
+  type EditorPane,
+} from "../store/workspace";
 
 const split = ref(0.44);
 const aiOn = computed(() => aiEnabled());
@@ -37,7 +52,7 @@ watch(
   },
 );
 const createInitial = computed(() => {
-  const path = state.detail?.path ?? "";
+  const path = activePane()?.detail?.path ?? "";
   const slash = path.lastIndexOf("/");
   return slash >= 0 ? path.slice(0, slash + 1) : "";
 });
@@ -58,7 +73,7 @@ function pickFromGraph(id: string, additive: boolean) {
 
 /** The editor's prompt: an AI session seeded with the node being edited. */
 async function askAboutNode(text: string) {
-  const detail = state.detail;
+  const detail = activePane()?.detail ?? null;
   if (!detail) return;
   const title = detail.name ?? detail.label;
   const id = await aiActions.start("editor", title, [detail.id]);
@@ -72,30 +87,6 @@ async function onSaveSettings(values: [string, string][]) {
 /** `action` rows in settings: only the Lean installer has one. */
 function onSettingAction(id: string) {
   if (id === "lean.action.install") void actions.installLean();
-}
-
-/** The editor's close confirmation, like the settings modal's. */
-const editorConfirm = ref(false);
-
-/** Closing the editor: an unsaved edit asks first, then goes. */
-function requestEditorClose() {
-  if (state.editorDirty) {
-    editorConfirm.value = true;
-    return;
-  }
-  actions.closeEditor();
-}
-
-/** Discards the unsaved edit and closes. */
-async function discardAndClose() {
-  editorConfirm.value = false;
-  await actions.discardDraft();
-  actions.closeEditor();
-}
-
-/** Keeps the edit and closes nothing. */
-function keepEditing() {
-  editorConfirm.value = false;
 }
 
 /** The build question, asked once per project unless the answer is remembered. */
@@ -163,10 +154,83 @@ const processingLabel = computed(() => {
 });
 
 /** True when the file open in the modal is one Lean is still working on. */
-const editorProcessing = computed(() => {
-  const path = state.detail?.path;
+/** True while Lean is still checking the file a pane shows. */
+function paneProcessing(pane: EditorPane) {
+  const path = pane.detail?.path;
   return Boolean(path && state.processingFiles.includes(path));
-});
+}
+
+/** The editor's settings, as the settings page spells them. */
+const debounce = computed(() => checkDebounce());
+const keys = computed(() => editorKeys());
+
+/** Double-click on a node: another modal when the modifier is held. */
+function openFromBoard(id: string, event?: Event) {
+  void actions.openNode(id, { fresh: freshRequested(event) });
+}
+
+/**
+ * True when the click carries the "open another editor" modifier
+ * (`Settings → Editor → Keyboard Shortcuts`).
+ */
+function freshRequested(event?: Event): boolean {
+  if (!event) return false;
+  const mouse = event as MouseEvent;
+  return matchesShortcut(
+    {
+      key: "Control",
+      ctrlKey: Boolean(mouse.ctrlKey),
+      metaKey: Boolean(mouse.metaKey),
+      altKey: Boolean(mouse.altKey),
+      shiftKey: Boolean(mouse.shiftKey),
+    },
+    newEditorKey(),
+  );
+}
+
+/** Held while dragging a board to look around, from settings. */
+const pan = computed(() => panKey());
+
+/**
+ * Ctrl+W closes the editor the user is working in — or asks first, when it holds
+ * an unsaved edit. Escape deliberately does nothing: it is a key pressed while
+ * thinking, not a decision to close anything.
+ */
+function onWindowKey(event: KeyboardEvent) {
+  if (!state.editors.length) return;
+  if (!matchesShortcut(event, closeKey())) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const pane = activePane() ?? state.editors[state.editors.length - 1];
+  if (pane) actions.requestClosePane(pane.id);
+}
+
+onMounted(() => window.addEventListener("keydown", onWindowKey, { capture: true }));
+onBeforeUnmount(() => window.removeEventListener("keydown", onWindowKey, { capture: true }));
+
+/**
+ * Work that has been running long enough to be worth a spinner.
+ *
+ * Some of it cannot be made short — re-reading the project after a save, or Lean
+ * checking a file — so the editor says it is happening instead of looking stuck.
+ */
+const slowBusy = ref<string | null>(null);
+let busyTimer: number | undefined;
+watch(
+  () => state.busy,
+  (busy) => {
+    window.clearTimeout(busyTimer);
+    if (!busy) {
+      slowBusy.value = null;
+      return;
+    }
+    // Anything quicker than this would only flicker.
+    busyTimer = window.setTimeout(() => {
+      slowBusy.value = busy;
+    }, 250);
+  },
+);
+onBeforeUnmount(() => window.clearTimeout(busyTimer));
 
 function toggleGraph(id: string) {
   void actions.toggleGraph(id);
@@ -220,7 +284,7 @@ async function copyPrinted() {
     <SettingsModal
       :open="state.settingsOpen"
       :tree="state.settings"
-      root-id="lean"
+      root-id="editor"
       :lean="state.lean"
       :install="state.install"
       @close="actions.setSettingsOpen(false)"
@@ -356,12 +420,13 @@ async function copyPrinted() {
             :camera="state.graph?.camera ?? null"
             :hover-info="state.hover"
             @pick="pickFromGraph"
+            :pan-key="pan"
             @camera="actions.saveCamera('ast', $event)"
             @settings="actions.setSettingsOpen(true)"
             @hover="actions.loadHover($event)"
             @bend="(key, value) => actions.saveLinkBend('ast', key, value)"
             @move="actions.savePositions('ast', $event)"
-            @open="actions.openNode($event)"
+            @open="(id: string, event: Event) => openFromBoard(id, event)"
             @select="actions.selectMany($event)"
             @toggle="toggleGraph"
           />
@@ -373,7 +438,7 @@ async function copyPrinted() {
             :files="state.view?.stats.files ?? 0"
             :nodes="state.view?.stats.nodes ?? 0"
             @pick="pickFromTree"
-            @open="actions.openNode($event)"
+            @open="(id: string, event: Event) => openFromBoard(id, event)"
             @select-many="actions.selectMany($event)"
             @create="askCreate"
             @delete="askDelete"
@@ -386,7 +451,7 @@ async function copyPrinted() {
         v-model:split="logicSplit"
         :logic="state.logic"
         :selected-ids="state.selectedIds"
-        @open="actions.openNode($event)"
+        @open="(id: string, event: Event) => openFromBoard(id, event)"
       />
     </div>
 
@@ -394,44 +459,63 @@ async function copyPrinted() {
 
     <AiModal />
 
+    <!-- One modal per open node: Ctrl+double-click opens another, a plain
+         double-click retargets the one the user last touched. -->
     <UiModal
-      :open="state.editorOpen"
-      :title="state.detail?.name ?? state.detail?.label ?? ''"
-      :badge="state.detail?.kind ?? ''"
-      :subtitle="state.detail?.path ?? ''"
+      v-for="(pane, index) in state.editors"
+      :key="pane.id"
+      :open="true"
+      :title="pane.detail?.name ?? pane.detail?.label ?? ''"
+      :badge="pane.detail?.kind ?? ''"
+      :subtitle="pane.detail?.path ?? ''"
       :width="640"
       :height="470"
       :resizable="true"
-      @close="requestEditorClose"
+      :layer="index"
+      :active="pane.id === state.activeEditor"
+      :geometry="pane.geometry"
+      :close-on-escape="false"
+      @close="actions.requestClosePane(pane.id)"
+      @focus="actions.focusPane(pane.id)"
+      @geometry="(geometry: { x: number; y: number; w: number; h: number }) =>
+        actions.setPaneGeometry(pane.id, geometry)"
     >
-      <div v-if="editorConfirm" class="board__warn">
+      <div v-if="pane.confirming" class="board__warn">
         <UiIcon name="alert" :size="12" />
         <span>discard the unsaved edit?</span>
-        <UiButton size="sm" variant="ghost" @click="keepEditing">keep editing</UiButton>
-        <UiButton size="sm" variant="solid" @click="discardAndClose">discard</UiButton>
+        <UiButton size="sm" variant="ghost" @click="actions.keepEditing(pane.id)">keep editing</UiButton>
+        <UiButton size="sm" variant="solid" @click="actions.discardAndClose(pane.id)">discard</UiButton>
       </div>
       <NodeEditor
-        :detail="state.detail"
+        :detail="pane.detail"
         :ai-enabled="aiOn"
-        :saving="state.saving"
-        :save-error="state.saveError"
-        :goals="state.goals"
-        :goals-busy="state.goalsBusy"
-        :term="state.term"
-        :term-busy="state.termBusy"
-        :processing="editorProcessing"
-        @preview="actions.previewText"
-        @save="actions.applyText"
-        @dirty="(value: boolean) => (state.editorDirty = value)"
-        @revert="actions.discardDraft"
-        @comments="actions.applyComments"
-        @rename="actions.rename"
+        :saving="pane.saving"
+        :error="pane.error"
+        :goals="pane.goals"
+        :goals-busy="pane.goalsBusy"
+        :term="pane.term"
+        :term-busy="pane.termBusy"
+        :multi="pane.multi"
+        :node-goals="pane.nodeGoals"
+        :locked="isLocked(pane)"
+        :busy="slowBusy"
+        :processing="paneProcessing(pane)"
+        :debounce="debounce"
+        :loading="pane.loading"
+        :keys="keys"
+        @preview="(text: string) => actions.previewText(pane.id, text)"
+        @save="(text: string) => actions.applyText(pane.id, text)"
+        @dirty="(value: boolean) => actions.setPaneDirty(pane.id, value)"
+        @selections="(count: number) => actions.setPaneSelections(pane.id, count)"
+        @revert="actions.discardPane(pane.id)"
+        @comments="(text: string) => actions.applyComments(pane.id, text)"
         @prompt="askAboutNode"
+        @refresh-goals="void actions.loadPaneGoals(pane.id)"
         @goals="(line: number, character: number) => {
-          void actions.loadGoals(line, character);
-          void actions.loadTerm(line, character);
+          void actions.loadPaneGoals(pane.id, line, character);
+          void actions.loadPaneTerm(pane.id, line, character);
         }"
-        @file="actions.showFile()"
+        @file="actions.openFilePane(pane.id)"
       />
     </UiModal>
 

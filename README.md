@@ -178,6 +178,84 @@ All project logic lives in Rust. Vue owns only presentation and view state (whic
 is visible, whether the modal is open, which tree rows are unfolded, split ratio, graph
 expansion is *not* view state — Rust owns it).
 
+## Starting up
+
+Two costs are paid once and both are paid behind a splash screen, before the welcome page:
+
+- **Lean's parser environment.** Lean imports its own `Init` and `Lean` modules the first
+  time it parses anything — seconds, and every later core parse reuses that environment.
+  `src-tauri/src/lean/startup.rs` builds it on a thread started from the app's `setup`, and
+  the splash polls `startup_state` for the step and the seconds spent. This is what turned
+  "opening the first project" from ~20 s into nothing.
+- **The editor.** Monaco is a large chunk, and its first `editor.create` lays out the DOM,
+  measures the font and starts the worker. The splash fetches the chunk *and* builds one
+  throwaway editor, so the first modal appears with its text already in it.
+
+The bar counts three steps (Lean's toolchain, Lean's parser, the editor) and the label says
+which one is in flight. A warm-up that fails (no Lean installed) is reported and the app
+starts anyway; one that never finishes is abandoned after 90 s.
+
+## The node editor
+
+The editor is **Monaco** (`monaco-editor`), the editor VS Code is built on, so the modal behaves
+the way the rest of the world's code boxes behave instead of the way a textarea with intentions
+does: several carets, find with Enter/Shift+Enter/Esc, word-wise movement and deletion, undo
+grouping, bracket pairing, snippets and the suggestion list all come from it.
+
+Monaco is loaded the first time an editor opens and never before — the welcome page still does
+nothing, and the module is a lazy chunk:
+
+```
+src/editor/monaco.ts        loads Monaco once, registers Lean's lexer and KLEAN's theme,
+                            turns `Ctrl+Shift+ArrowUp` into a Monaco keybinding
+src/editor/keys.ts          the shortcut strings the settings hold (`npm test` covers it)
+src/components/ui/CodeEditor.vue  the seam between Monaco and the app
+```
+
+`CodeEditor.vue` owns only what Monaco cannot know:
+
+- **a model per document** (`ast:<file>#<path>`, `file:<path>`): undo history and folding belong
+  to that node, and coming back to it finds them where they were left;
+- **the text in and out** — typing goes up as `update:modelValue` (which the store checks
+  against Lean without writing), a revert or a sibling save comes back down without a loop;
+- **Lean's diagnostics** as Monaco markers, on the file's own line numbers (the gutter is
+  renumbered through `lineNumbers`), with Lean's message on hover;
+- **completions** from `textDocument/completion`: the suggestions are Lean's — keywords, tactics,
+  the names in scope, the fields of the structures in scope — because they come from the server
+  that elaborated the file;
+- **the app's shortcuts**, bound onto Monaco's own commands: `editor.action.addSelectionToNextFindMatch`
+  (Ctrl+D), `selectHighlights` (Ctrl+Shift+L), `insertCursorAbove`/`Below` (Alt+Shift+Arrow),
+  `copyLinesUpAction`/`DownAction` (Ctrl+Alt+Shift+Arrow), `actions.find`, `undo`, `redo`. The keys
+  are `Settings → Editor → Keyboard Shortcuts`, so there is one set of shortcuts, not two that
+  drift apart. Word-wise movement and deletion (Ctrl+Arrow, Ctrl+Backspace, Ctrl+Delete) are
+  Monaco's own.
+
+One modal per node, and never two for the same file: opening the file a node lives in replaces
+that node's modal, a node of an open file replaces the file's modal, and the same node is never
+open twice — a double-click with the modifier raises it instead.
+
+**Two editors of one file are never edited at once.** The edited text of a file lives in Rust,
+once per file (`Project::drafts`), and both modals of that file read it — but the moment one of
+them holds an unsaved edit, the others are **locked** (read-only, with a line in the footer
+saying why). Saving writes the file, re-reads every open editor of it and unlocks them;
+discarding does the same with the disk's text. That is a merge rule two panels can keep, and it
+keeps a node modal and its file modal from disagreeing.
+
+Nodes are read from the **core parse** — the tree the board's ids were built from, always in the
+cache — rather than a parse with the file's imports loaded: the import environment is Lean
+building a library, and it bought nothing here (the language server parses the text it is given).
+That is what makes opening an editor instant even on a built project.
+
+A double-click while the modal holds an unsaved edit does not reload it: the modal says so and
+waits (discarding the edit continues to the node that was asked for). Any modification dismisses
+that question — typing is an answer. Escape never closes an editor; **Ctrl+W** does (and asks
+first when there is something unsaved), both configurable in `Settings → Editor`. A yellow dot
+sits on the *save* button while the disk is missing something.
+
+```bash
+npm test        # the shortcut settings: parsing, matching, mouse modifiers
+```
+
 ## How Lean is used
 
 KLEAN contains no Lean parser. Everything the board shows is what the official
@@ -308,12 +386,13 @@ module is loaded, so memory does not grow with the project. Measured here: 150 f
   keeps its own process and reports diagnostics as it finds them. Editing a node sends only
   that file's change (one replaced range) and re-checks only that file; the rest of the
   project is untouched, so typing stays responsive no matter how large the project is.
-- **Typing is checked, not saved.** KLEAN never writes while you type: the edited declaration
-  is spliced into the file *in memory*, handed to Lean at once, and the diagnostics come back
-  under the caret — the board's tree is left out of that path, which is what keeps a keystroke
-  cheap. The file on disk changes only when you save (Ctrl/Cmd+S or the *save* button), and
-  closing the editor with an unsaved edit asks first, like the settings modal. Discarding puts
-  the saved text back in front of Lean, so nothing stale is left behind.
+- **Typing is checked, not saved.** KLEAN never writes while you type: once typing pauses
+  (*Editor → Check Debounce*, 200 ms by default) the edited declaration is spliced into the file
+  *in memory*, handed to Lean, and the diagnostics come back under the caret — the board's tree
+  is left out of that path, which is what keeps a keystroke cheap. The file on disk changes only
+  when you save (Ctrl/Cmd+S or the *save* button), and closing the editor with an unsaved edit
+  asks first, like the settings modal. Discarding puts the saved text back in front of Lean, so
+  nothing stale is left behind.
 - **The welcome page does nothing**: no parsing, no server, no build — the binary sits at
   ~200 MB and no Lean process exists until a project is opened.
 - **Building** is the one expensive action, so it is a question, not a side effect: when a

@@ -35,11 +35,12 @@ pub mod project;
 pub mod recents;
 pub mod scan;
 pub mod settings;
+pub mod startup;
 pub mod toolchain;
 
 pub use settings::SettingNode;
 pub use ast::{AstNode, Diagnostic, LineIndex, ParsedFile, Severity, Span};
-pub use engine::{Engine, LeanStatus};
+pub use engine::{Completion, Engine, LeanStatus};
 pub use toolchain::Toolchain;
 
 pub use dto::{

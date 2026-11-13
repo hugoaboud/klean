@@ -2,10 +2,11 @@
 // Project settings.
 //
 // The tree comes from Rust; this component only edits the values. Rows are
-// rendered by kind: a switch for booleans, a select for enums, an input for
-// text. Nothing is written until "save" — closing with unsaved changes asks
-// first.
-import { computed, ref, watch } from "vue";
+// rendered by kind: a switch for booleans, a select for enums, an input for text,
+// and a capture button for a shortcut, which is written by pressing it. Nothing is
+// written until "save" — closing with unsaved changes asks first.
+import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { formatShortcut, parseShortcut } from "../editor/keys";
 import type { LeanStatus, SettingNode } from "../api/lean";
 import UiButton from "./ui/UiButton.vue";
 import UiIcon from "./ui/UiIcon.vue";
@@ -33,6 +34,81 @@ const emit = defineEmits<{
 const draft = ref<SettingNode[]>([]);
 const expanded = ref<Set<string>>(new Set());
 const confirming = ref(false);
+
+/** The shortcut row whose capture is listening, if any. */
+const capturing = ref<string | null>(null);
+/** What has been pressed so far, shown the moment the key goes down. */
+const captured = ref("");
+
+/** Starts listening for a combination on one row. */
+function capture(node: SettingNode) {
+  if (capturing.value === node.id) {
+    stopCapture();
+    return;
+  }
+  stopCapture();
+  capturing.value = node.id;
+  captured.value = node.value;
+  window.addEventListener("keydown", onCaptureDown, { capture: true });
+}
+
+function onCaptureDown(event: KeyboardEvent) {
+  if (!capturing.value) return;
+  // The settings modal would otherwise scroll, close or switch group under us.
+  event.preventDefault();
+  event.stopPropagation();
+  const modifiers = formatShortcut({
+    control: event.ctrlKey || event.metaKey,
+    alt: event.altKey,
+    shift: event.shiftKey,
+    key: "",
+  });
+  const isModifierKey = ["Control", "Meta", "Alt", "Shift"].includes(event.key);
+  if (isModifierKey) {
+    // A modifier on its own is a valid shortcut (the gestures that hold one down),
+    // so it is shown as it is pressed and accepted when the key comes up.
+    captured.value = modifiers;
+    window.addEventListener("keyup", onCaptureUp, { once: true });
+    return;
+  }
+  if (event.key === "Escape") {
+    stopCapture();
+    return;
+  }
+  const name = event.key.length === 1 ? event.key.toUpperCase() : event.key;
+  commitCapture([modifiers, name].filter(Boolean).join("+"));
+}
+
+function onCaptureUp() {
+  if (!capturing.value) return;
+  if (captured.value) commitCapture(captured.value);
+}
+
+function commitCapture(value: string) {
+  const id = capturing.value;
+  stopCapture();
+  if (!id || !value) return;
+  const node = findNode(draft.value, id);
+  if (node) setValue(node, parseShortcut(value) ? value : node.value);
+}
+
+function stopCapture() {
+  capturing.value = null;
+  captured.value = "";
+  window.removeEventListener("keydown", onCaptureDown, { capture: true });
+  window.removeEventListener("keyup", onCaptureUp);
+}
+
+function findNode(nodes: SettingNode[], id: string): SettingNode | null {
+  for (const node of nodes) {
+    if (node.id === id) return node;
+    const inner = findNode(node.children, id);
+    if (inner) return inner;
+  }
+  return null;
+}
+
+onBeforeUnmount(stopCapture);
 
 function clone(nodes: SettingNode[]): SettingNode[] {
   return nodes.map((node) => ({ ...node, children: clone(node.children) }));
@@ -217,6 +293,17 @@ function discard() {
                     {{ props.install ?? leaf.label }}
                   </UiButton>
 
+                  <button
+                    v-else-if="leaf.kind === 'key'"
+                    class="settings__input settings__key k-mono"
+                    :data-capturing="capturing === leaf.id || undefined"
+                    type="button"
+                    :title="capturing === leaf.id ? 'Press the keys, then Esc to cancel' : 'Click, then press the keys'"
+                    @click="capture(leaf)"
+                  >
+                    {{ capturing === leaf.id ? captured || "press…" : leaf.value || "none" }}
+                    <span class="settings__key-hint">{{ capturing === leaf.id ? "stop" : "capture" }}</span>
+                  </button>
                   <textarea
                     v-else-if="leaf.multiline"
                     class="settings__input settings__input--area k-mono"
@@ -274,6 +361,17 @@ function discard() {
                   {{ props.install ?? child.label }}
                 </UiButton>
 
+                <button
+                  v-else-if="child.kind === 'key'"
+                  class="settings__input settings__key k-mono"
+                  :data-capturing="capturing === child.id || undefined"
+                  type="button"
+                  :title="capturing === child.id ? 'Press the keys, then Esc to cancel' : 'Click, then press the keys'"
+                  @click="capture(child)"
+                >
+                  {{ capturing === child.id ? captured || "press…" : child.value || "none" }}
+                  <span class="settings__key-hint">{{ capturing === child.id ? "stop" : "capture" }}</span>
+                </button>
                 <textarea
                   v-else-if="child.multiline"
                   class="settings__input settings__input--area k-mono"
@@ -459,6 +557,29 @@ function discard() {
   resize: vertical;
   line-height: 1.5;
   white-space: pre-wrap;
+}
+
+/* A shortcut row: the combination, and the capture affordance beside it. */
+.settings__key {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.settings__key[data-capturing] {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.settings__key-hint {
+  color: var(--text-ghost);
+  font-size: var(--fs-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .settings__input:focus,

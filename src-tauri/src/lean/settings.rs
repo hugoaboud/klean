@@ -24,6 +24,8 @@ pub enum SettingKind {
     Text,
     /// A button: the front-end calls the command named by the setting's id.
     Action,
+    /// A key combination (`Ctrl+Shift+L`), captured by pressing it.
+    Key,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +90,15 @@ impl SettingNode {
     fn text_area(id: &str, label: &str, value: &str, help: &str) -> SettingNode {
         SettingNode {
             multiline: true,
+            ..Self::text(id, label, value, help)
+        }
+    }
+
+    /// A shortcut: the value is a combination such as `Ctrl+Shift+L`, written by
+    /// pressing it rather than typing it.
+    fn key(id: &str, label: &str, value: &str, help: &str) -> SettingNode {
+        SettingNode {
+            kind: SettingKind::Key,
             ..Self::text(id, label, value, help)
         }
     }
@@ -321,6 +332,99 @@ pub fn tree(values: &BTreeMap<String, String>) -> Vec<SettingNode> {
     )
     .gated_by(AI_ENABLED);
 
+    let editor = SettingNode::group(
+        "editor",
+        "Editor",
+        "How the node editor behaves while you type.",
+        vec![
+            SettingNode::text(
+                "editor.check_debounce",
+                "Check Debounce (ms)",
+                &get("editor.check_debounce", "300"),
+                "How long typing has to pause before Lean is asked about the node. The whole node is re-checked once, from memory — no file is written.",
+            ),
+            SettingNode::group(
+                "editor.keys",
+                "Keyboard Shortcuts",
+                "Click capture, then press the keys. The editor and the boards read these.",
+                vec![
+                    SettingNode::key(
+                        "editor.keys.undo",
+                        "Undo",
+                        &get("editor.keys.undo", "Ctrl+Z"),
+                        "Inside the node editor.",
+                    ),
+                    SettingNode::key(
+                        "editor.keys.redo",
+                        "Redo",
+                        &get("editor.keys.redo", "Ctrl+Shift+Z"),
+                        "Inside the node editor.",
+                    ),
+                    SettingNode::key(
+                        "editor.keys.find",
+                        "Find in Node",
+                        &get("editor.keys.find", "Ctrl+F"),
+                        "Searches the text open in that editor, nothing else.",
+                    ),
+                    SettingNode::key(
+                        "editor.keys.add_occurrence",
+                        "Add Next Occurrence",
+                        &get("editor.keys.add_occurrence", "Ctrl+D"),
+                        "Selects the next match of the selection, for editing several places at once.",
+                    ),
+                    SettingNode::key(
+                        "editor.keys.all_occurrences",
+                        "Select All Occurrences",
+                        &get("editor.keys.all_occurrences", "Ctrl+Shift+L"),
+                        "Selects every match of the selection, for editing several places at once.",
+                    ),
+                    SettingNode::key(
+                        "editor.keys.cursor_above",
+                        "Add Cursor Above",
+                        &get("editor.keys.cursor_above", "Alt+Shift+ArrowUp"),
+                        "Another caret on the line above, for editing several lines at once.",
+                    ),
+                    SettingNode::key(
+                        "editor.keys.cursor_below",
+                        "Add Cursor Below",
+                        &get("editor.keys.cursor_below", "Alt+Shift+ArrowDown"),
+                        "Another caret on the line below.",
+                    ),
+                    SettingNode::key(
+                        "editor.keys.duplicate_up",
+                        "Duplicate Line Up",
+                        &get("editor.keys.duplicate_up", "Ctrl+Alt+Shift+ArrowUp"),
+                        "Copies the line above the cursor, as VS Code does.",
+                    ),
+                    SettingNode::key(
+                        "editor.keys.duplicate_down",
+                        "Duplicate Line Down",
+                        &get("editor.keys.duplicate_down", "Ctrl+Alt+Shift+ArrowDown"),
+                        "Copies the line below the cursor.",
+                    ),
+                    SettingNode::key(
+                        "editor.keys.close",
+                        "Close Editor",
+                        &get("editor.keys.close", "Ctrl+W"),
+                        "Closes the editor modal the user is working in. With an unsaved edit it asks first; Escape never closes it.",
+                    ),
+                    SettingNode::key(
+                        "editor.keys.new_editor",
+                        "Open a New Editor (hold)",
+                        &get("editor.keys.new_editor", "Ctrl"),
+                        "Hold this while double-clicking a tree node to open it in another editor. Without it, a double-click reuses the editor you last touched.",
+                    ),
+                    SettingNode::key(
+                        "editor.keys.pan",
+                        "Pan the Canvas (hold)",
+                        &get("editor.keys.pan", "Ctrl"),
+                        "Hold this while dragging a board to look around.",
+                    ),
+                ],
+            ),
+        ],
+    );
+
     // A place for the user's own words: whatever is written here is appended to
     // KLEAN's built-in system prompt for every session.
     let customize = SettingNode::group(
@@ -346,6 +450,7 @@ pub fn tree(values: &BTreeMap<String, String>) -> Vec<SettingNode> {
 
     vec![
         lean,
+        editor,
         SettingNode::group(
             "ai",
             "AI",
@@ -371,36 +476,31 @@ pub fn defaults() -> Vec<(&'static str, String)> {
     Vec::new()
 }
 
+/// Every id the tree declares, groups included.
+///
+/// It is read *from the tree* rather than listed by hand: a hand-written list is
+/// how settings used to be saved and silently dropped afterwards — a value for a
+/// setting added later was refused for being unknown, and the modal went on
+/// showing the default.
+fn known() -> &'static std::collections::HashSet<String> {
+    static KNOWN: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    KNOWN.get_or_init(|| {
+        fn walk(nodes: &[SettingNode], out: &mut std::collections::HashSet<String>) {
+            for node in nodes {
+                out.insert(node.id.clone());
+                walk(&node.children, out);
+            }
+        }
+        let mut out = std::collections::HashSet::new();
+        walk(&tree(&BTreeMap::new()), &mut out);
+        out
+    })
+}
+
 /// True when `id` names a known setting (groups included).
 pub fn is_known(id: &str) -> bool {
-    matches!(id, "lean" | "ai" | "ai.model" | "ai.tools" | "ai.sandbox")
-        || matches!(
-            id,
-            toolchain::SETTING_ENABLED
-                | toolchain::SETTING_MODE
-                | toolchain::SETTING_PATH
-                | toolchain::SETTING_CHANNEL
-                | toolchain::SETTING_INSTALL_CHANNEL
-                | toolchain::SETTING_BUILD_PROMPT
-                | toolchain::SETTING_TIMEOUT
-                | toolchain::SETTING_MEMORY
-                | toolchain::ACTION_INSTALL
-        )
-        || matches!(
-            id,
-            AI_ENABLED
-                | "ai.model.type"
-                | "ai.model.name"
-                | "ai.model.url"
-                | "ai.model.api_key"
-                | "ai.model.max_tokens"
-                | "ai.model.temperature"
-                | "ai.tools.view_ast"
-                | "ai.tools.expand"
-                | "ai.tools.diagram"
-                | "ai.tools.ask"
-                | "ai.tools.ask_multi"
-        )
+    known().contains(id)
 }
 
 /// True when the value of `id` belongs in the secrets file rather than the
@@ -448,6 +548,24 @@ pub fn ensure_secrets_ignored(fs: &ProjectFs) -> LeanResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every setting the tree declares can be stored: the save path asks this, and
+    /// a hand-written list is how new settings used to be dropped on save.
+    #[test]
+    fn every_setting_in_the_tree_is_known() {
+        fn walk(nodes: &[SettingNode]) {
+            for node in nodes {
+                assert!(
+                    is_known(&node.id),
+                    "`{}` is in the tree, so its value has to be storable",
+                    node.id
+                );
+                walk(&node.children);
+            }
+        }
+        walk(&tree(&BTreeMap::new()));
+        assert!(!is_known("editor.nonsense"), "unknown ids are still refused");
+    }
 
     /// `Settings → AI → Customize` exists, is hidden until AI is on, and its one
     /// value is a prompt written over several lines.

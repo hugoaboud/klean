@@ -18,6 +18,10 @@ pub fn run() {
             }
             if let Ok(dir) = app.path().app_data_dir() {
                 let _ = std::fs::create_dir_all(&dir);
+                // Lean's parser environment costs seconds the first time: build it
+                // now, while the splash screen is up, not when the first project is
+                // opened.
+                lean::startup::start(dir.clone());
                 state.attach_app_data(dir);
             }
             if let Some(path) = std::env::args().nth(1) {
@@ -82,6 +86,8 @@ pub fn run() {
             commands::lean_check_file,
             commands::lean_goals,
             commands::lean_hover,
+            commands::lean_completions,
+            commands::startup_state,
             commands::lean_install,
             commands::ai_sessions,
             commands::ai_open,

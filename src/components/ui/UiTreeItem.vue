@@ -23,7 +23,8 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   pick: [string, boolean];
-  open: [string];
+  /** A node was opened: its id, and the click that asked for it. */
+  open: [string, MouseEvent];
   openTheory: [string];
   toggle: [string];
   drop: [ids: string[], target: string];
@@ -136,7 +137,9 @@ watch(selected, (isSelected) => {
       :draggable="canDrag || undefined"
       :data-drop="dragOver || undefined"
       @click="emit('pick', node.id, $event.ctrlKey || $event.metaKey || $event.shiftKey)"
-      @dblclick.stop="node.kind === 'theory' ? emit('openTheory', node.id) : emit('open', node.id)"
+      @dblclick.stop="
+        node.kind === 'theory' ? emit('openTheory', node.id) : emit('open', node.id, $event)
+      "
       @dragstart="onDragStart"
       @dragover.prevent="acceptsDrop ? (dragOver = true) : undefined"
       @dragleave="dragOver = false"
@@ -174,7 +177,7 @@ watch(selected, (isSelected) => {
         :draggable="draggable"
         :drop-kinds="dropKindsList"
         @pick="onChildPick"
-        @open="emit('open', $event)"
+        @open="(id: string, event: MouseEvent) => emit('open', id, event)"
         @open-theory="emit('openTheory', $event)"
         @toggle="emit('toggle', $event)"
         @drop="(ids: string[], target: string) => emit('drop', ids, target)"

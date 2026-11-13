@@ -53,6 +53,9 @@ pub struct NodeDetail {
 #[derive(Debug, Clone, Serialize)]
 pub struct DiagnosticDto {
     pub line: u32,
+    /// 1-based line it ends on: a diagnostic can cover several lines.
+    #[serde(default)]
+    pub end_line: u32,
     pub severity: String,
     pub message: String,
 }

@@ -14,7 +14,7 @@ use super::dto::{
     CameraDto, DiagnosticDto, GraphLink, GraphNode, LogicGraph, NodeDetail, PreviewResult,
     ProjectGraph, ProjectSummary, SettingNode, Stats, TreeNode, UpdateResult, WorkspaceView,
 };
-use super::engine::{Engine, LeanStatus, Parse};
+use super::engine::{Completion, Engine, LeanStatus, Parse};
 use super::error::{LeanError, LeanResult};
 use super::fs::{content_hash, ProjectFs};
 use super::layout::{Camera, LayoutFile, Placement};
@@ -224,7 +224,7 @@ impl Project {
     ) -> LeanResult<Option<String>> {
         let (rel, default_line) = match self.resolve(id)? {
             Target::Ast { rel, path } => {
-                let cached = self.load(&rel, Parse::Exact)?;
+                let cached = self.load(&rel, Parse::Tree)?;
                 let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
                 let line = cached.lines.line_of(node.inner.end);
                 (rel, line)
@@ -232,7 +232,7 @@ impl Project {
             Target::File(rel) | Target::AstGroup(rel) => (rel, 1),
             _ => return Err(LeanError::msg("only files and declarations have terms")),
         };
-        let cached = self.load(&rel, Parse::Exact)?;
+        let cached = self.load(&rel, Parse::Tree)?;
         let source = cached.source.clone();
         let absolute = self
             .fs
@@ -250,8 +250,16 @@ impl Project {
             Target::Ast { rel, path } => {
                 let cached = self.load(&rel, Parse::Tree)?;
                 let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
+                // Without a position the answer is about the *declaration*: the end
+                // of its last line, which is where Lean reports what is left to
+                // prove — or nothing, when the proof is finished.
                 let line = cached.lines.line_of(node.inner.end);
-                (rel, line, 0)
+                let column = utf16_column(
+                    &cached.source,
+                    cached.lines.start_of(line),
+                    node.inner.end,
+                );
+                (rel, line, column)
             }
             Target::File(rel) | Target::AstGroup(rel) => (rel, 1, 0),
             _ => return Err(LeanError::msg("only files and declarations have goals")),
@@ -266,6 +274,37 @@ impl Project {
         let character = character.unwrap_or(default_char);
         drop(cached);
         self.engine.goals(&absolute, &source, line, character)
+    }
+
+    /// What Lean offers to complete at a position in a node's text.
+    ///
+    /// The position the editor reports is inside the *node*, and Lean counts lines
+    /// from the top of the *file*: the two are put together here, as they are for
+    /// goals and hovers.
+    pub fn lean_completions(
+        &mut self,
+        id: &str,
+        line: u32,
+        character: u32,
+    ) -> LeanResult<Vec<Completion>> {
+        let (rel, first_line) = match self.resolve(id)? {
+            Target::Ast { rel, path } => {
+                let cached = self.load(&rel, Parse::Tree)?;
+                let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
+                (rel, cached.lines.line_of(node.inner.start))
+            }
+            Target::File(rel) | Target::AstGroup(rel) => (rel, 1),
+            _ => return Err(LeanError::msg("only files and declarations have completions")),
+        };
+        let cached = self.load(&rel, Parse::Tree)?;
+        let source = cached.source.clone();
+        let absolute = self
+            .fs
+            .absolute(&rel)
+            .ok_or_else(|| LeanError::msg("Lean completions need a folder project"))?;
+        drop(cached);
+        let line = first_line + line.saturating_sub(1);
+        self.engine.completions(&absolute, &source, line, character)
     }
 
     pub fn fs(&self) -> &ProjectFs {
@@ -1035,10 +1074,17 @@ impl Project {
 
     // ---------------------------------------------------------------- detail
 
+    /// One node as the editor shows it.
+    ///
+    /// The span and the text come from the **core** parse — the one the board's ids
+    /// were built from — so a lookup can never land on a different node, and opening
+    /// an editor costs nothing: that tree is already in the cache. (Asking for
+    /// `Parse::Exact` here used to make the first editor open take as long as Lean
+    /// needs to load the file's imports.)
     pub fn detail(&mut self, id: &str) -> LeanResult<NodeDetail> {
         match self.resolve(id)? {
             Target::Ast { rel, path } => {
-                let cached = self.load(&rel, Parse::Exact)?;
+                let cached = self.load(&rel, Parse::Tree)?;
 
                 let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
                 let start_line = cached.lines.line_of(node.inner.start);
@@ -1063,7 +1109,7 @@ impl Project {
                 })
             }
             Target::File(rel) | Target::AstGroup(rel) => {
-                let cached = self.load(&rel, Parse::Exact)?;
+                let cached = self.load(&rel, Parse::Tree)?;
                 Ok(NodeDetail {
                     id: id.to_string(),
                     label: file_name(&rel),
@@ -1140,7 +1186,7 @@ impl Project {
     pub fn update(&mut self, id: &str, text: &str) -> LeanResult<UpdateResult> {
         let (rel, span) = match self.resolve(id)? {
             Target::Ast { rel, path } => {
-                let cached = self.load(&rel, Parse::Exact)?;
+                let cached = self.load(&rel, Parse::Tree)?;
 
                 let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
                 (rel, Some(node.inner))
@@ -1175,7 +1221,7 @@ impl Project {
     pub fn preview(&mut self, id: &str, text: &str) -> LeanResult<PreviewResult> {
         let (rel, span) = match self.resolve(id)? {
             Target::Ast { rel, path } => {
-                let cached = self.load(&rel, Parse::Exact)?;
+                let cached = self.load(&rel, Parse::Tree)?;
                 let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
                 (rel, Some(node.inner))
             }
@@ -1250,22 +1296,12 @@ impl Project {
 
     /// Parses the edited text and gives it to the language server, holding it as the
     /// draft for this file until it is saved or thrown away.
+    ///
+    /// The parse is the *core* one, like every other lookup: it is there to place the
+    /// nodes and the diagnostics, not to understand the project's notation — that is
+    /// the language server's job, and it takes the text whole.
     fn hold_draft(&mut self, rel: &str, source: String) {
-        // One draft at a time: the editor edits one node, and a draft left behind on
-        // another file would quietly become that file's content for the board.
-        let stale: Vec<String> = self
-            .drafts
-            .keys()
-            .filter(|held| *held != rel)
-            .cloned()
-            .collect();
-        for held in stale {
-            self.drafts.remove(&held);
-            if let Ok(saved) = self.fs.read(&held) {
-                self.engine.sync(&held, &saved);
-            }
-        }
-        let parsed = self.parse_with_lean(rel, &source, Parse::Exact);
+        let parsed = self.parse_with_lean(rel, &source, Parse::Tree);
         let draft = Arc::new(CachedFile {
             rel: rel.to_string(),
             hash: content_hash(&source),
@@ -1286,7 +1322,7 @@ impl Project {
     pub fn update_comments(&mut self, id: &str, text: &str) -> LeanResult<UpdateResult> {
         let (rel, comment_span, node_start, indent, region_start) = match self.resolve(id)? {
             Target::Ast { rel, path } => {
-                let cached = self.load(&rel, Parse::Exact)?;
+                let cached = self.load(&rel, Parse::Tree)?;
 
                 let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
                 let line_start = line_start_of(&cached.source, node.span.start);
@@ -2280,11 +2316,18 @@ fn splice(source: &str, span: Span, text: &str) -> LeanResult<String> {
 }
 
 /// The diagnostics that fall inside a node's lines.
+/// The diagnostics that touch a node's lines.
+///
+/// A diagnostic can cover several lines, and one that *starts* above the node can
+/// still point inside it — testing only the first line is how errors used to go
+/// missing from the editor while the panel listed them.
 fn node_diagnostics(cached: &CachedFile, start_line: u32, end_line: u32) -> Vec<Diagnostic> {
     cached
         .diagnostics()
         .into_iter()
-        .filter(|diagnostic| diagnostic.line >= start_line && diagnostic.line <= end_line)
+        .filter(|diagnostic| {
+            diagnostic.end_line.max(diagnostic.line) >= start_line && diagnostic.line <= end_line
+        })
         .collect()
 }
 
@@ -2293,6 +2336,7 @@ fn diagnostics_of(diagnostics: &[Diagnostic]) -> Vec<DiagnosticDto> {
         .iter()
         .map(|diagnostic| DiagnosticDto {
             line: diagnostic.line,
+            end_line: diagnostic.end_line.max(diagnostic.line),
             severity: diagnostic.severity.label().to_string(),
             message: diagnostic.message.clone(),
         })
@@ -3058,6 +3102,92 @@ mod editor_tests {
         assert!(labels.contains(&"t"), "the declarations arrived: {labels:?}");
     }
 
+    /// A saved setting comes back in the tree — including the ones added after the
+    /// save path was written, which used to be dropped for being unknown.
+    #[test]
+    fn saved_settings_are_shown_again() {
+        let root = scratch("settings");
+        let mut project = Project::open(&root, std::env::temp_dir().join("klean-test-appdata"))
+            .expect("project");
+        project
+            .save_settings(&[
+                ("editor.check_debounce".to_string(), "450".to_string()),
+                ("editor.keys.find".to_string(), "Ctrl+Alt+F".to_string()),
+                ("ai.customize.system_prompt".to_string(), "Answer in French.".to_string()),
+            ])
+            .expect("save");
+
+        let value = |id: &str| -> Option<String> {
+            fn walk(nodes: &[SettingNode], id: &str) -> Option<String> {
+                for node in nodes {
+                    if node.id == id {
+                        return Some(node.value.clone());
+                    }
+                    if let Some(found) = walk(&node.children, id) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            walk(&project.settings_tree(), id)
+        };
+        assert_eq!(value("editor.check_debounce").as_deref(), Some("450"));
+        assert_eq!(value("editor.keys.find").as_deref(), Some("Ctrl+Alt+F"));
+        assert_eq!(
+            value("ai.customize.system_prompt").as_deref(),
+            Some("Answer in French.")
+        );
+    }
+
+    /// A file's edited text lives in one place: a node editor and the file editor of
+    /// the same file read the same memory, which is what keeps two modals in sync.
+    #[test]
+    fn the_file_document_is_shared_between_its_editors() {
+        let root = scratch("shared");
+        let mut project = Project::open(&root, std::env::temp_dir().join("klean-test-appdata"))
+            .expect("project");
+        project.view().expect("view");
+        let def = project
+            .view()
+            .expect("view")
+            .tree
+            .first()
+            .and_then(|lib| super::tests::find_file(lib, "Demo/Basic.lean"))
+            .and_then(|file| file.children.first().cloned())
+            .map(|node| node.id)
+            .expect("the definition");
+
+        // Typed in the node's editor: the file's editor already holds it.
+        project
+            .preview(&def, "def two : Nat := 42")
+            .expect("preview the node");
+        let file = project.detail("file:Demo/Basic.lean").expect("file detail");
+        assert!(
+            file.text.contains("def two : Nat := 42"),
+            "the node's edit is part of the file: {}",
+            file.text
+        );
+
+        // Typed in the file's editor: the node's editor already holds it.
+        let whole = file.text.replace("Nat := 42", "Nat := 43");
+        project
+            .preview("file:Demo/Basic.lean", &whole)
+            .expect("preview the file");
+        let node = project.detail(&def).expect("detail");
+        assert!(
+            node.text.contains("43"),
+            "the file's edit reaches the node: {}",
+            node.text
+        );
+
+        // Discarding drops the memory for all of them.
+        project.discard_draft(&def).expect("discard");
+        let node = project.detail(&def).expect("detail");
+        assert!(node.text.contains(":= 2"), "back to the disk: {}", node.text);
+        let file = project.detail("file:Demo/Basic.lean").expect("file detail");
+        assert!(!file.text.contains("42"), "the file reverts too: {}", file.text);
+    }
+
     /// Typing a term Lean does not know has to show up as an error in the editor.
     #[test]
     fn a_broken_edit_reports_lean_errors() {
@@ -3096,13 +3226,31 @@ mod editor_tests {
         settle(&mut project);
 
         let broken = project.detail(&def).expect("detail");
+        let error = broken
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.severity == "error")
+            .unwrap_or_else(|| panic!("Lean's error has to reach the editor: {:?}", broken.diagnostics));
+        // The editor paints a diagnostic on the line Lean named, mapped through the
+        // node's first line — so that line has to be inside the node, and the text
+        // the editor holds has to have it.
         assert!(
-            broken
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.severity == "error"),
-            "Lean's error has to reach the editor: {:?}",
-            broken.diagnostics
+            error.line >= broken.start_line && error.line <= broken.end_line,
+            "the error line {} is inside the node (lines {}..={})",
+            error.line,
+            broken.start_line,
+            broken.end_line
+        );
+        assert!(
+            error.end_line >= error.line,
+            "a diagnostic's range never ends before it starts"
+        );
+        let document_lines = broken.text.split('\n').count() as u32;
+        assert!(
+            error.line - broken.start_line + 1 <= document_lines,
+            "the error maps onto a line the editor shows: {} of {}",
+            error.line - broken.start_line + 1,
+            document_lines
         );
     }
 

@@ -10,6 +10,7 @@
 // rubber-band selection, ctrl/cmd + drag to pan, wheel to zoom, click to select,
 // double click to open the editor.
 import * as d3 from "d3";
+import { matchesShortcut } from "../editor/keys";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { Camera, FixedNode, GraphLink, GraphNode, NodeDetail } from "../api/lean";
 import {
@@ -45,6 +46,8 @@ const props = withDefaults(
     statusKinds?: string[];
     /** Draw the status glyph. Off when the background already carries it. */
     statusIcon?: boolean;
+    /** Held while dragging to look around, from `Settings → Editor`. */
+    panKey?: string;
   }>(),
   {
     groupKinds: () => ["lib", "folder", "file", "astgroup"],
@@ -53,13 +56,14 @@ const props = withDefaults(
     camera: null,
     hoverInfo: null,
     statusKinds: () => [],
+    panKey: "Ctrl",
   },
 );
 
 const emit = defineEmits<{
   pick: [string, boolean];
   select: [string[]];
-  open: [string];
+  open: [string, PointerEvent];
   toggle: [string];
   move: [FixedNode[]];
   camera: [Camera];
@@ -92,6 +96,23 @@ function statusGlyph(status: string): string {
   if (status === "proven") return "✓";
   if (status === "sorry") return "!";
   return "✕";
+}
+
+/**
+ * True when this event carries the modifier the user set for looking around the
+ * board by dragging it (`Settings → Editor → Pan the Canvas`).
+ */
+function pans(event: { ctrlKey: boolean; metaKey: boolean; altKey: boolean; shiftKey: boolean }): boolean {
+  return matchesShortcut(
+    {
+      key: "Control",
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      altKey: event.altKey,
+      shiftKey: event.shiftKey,
+    },
+    props.panKey ?? "Ctrl",
+  );
 }
 
 let svg: d3.Selection<SVGSVGElement, unknown, null, undefined> | null = null;
@@ -262,7 +283,7 @@ function mount() {
     .filter((event: Event) => {
       if (event.type === "wheel") return true;
       const mouse = event as MouseEvent;
-      return mouse.type === "mousedown" && (mouse.ctrlKey || mouse.metaKey);
+      return mouse.type === "mousedown" && pans(mouse);
     })
     .on("zoom", (event) => {
       root?.attr("transform", event.transform.toString());
@@ -847,9 +868,11 @@ function release(event: PointerEvent, node: SimNode) {
   if (!state || state.id !== node.id || state.moved) return;
   const additive = event.ctrlKey || event.metaKey;
   const now = Date.now();
-  if (!additive && lastPick.id === node.id && now - lastPick.time < 380) {
+  // A double-click opens, modifier or not: the page reads the modifier from the
+  // event to decide between another editor and the pane the user last touched.
+  if (lastPick.id === node.id && now - lastPick.time < 380) {
     lastPick = { id: "", time: 0 };
-    emit("open", node.id);
+    emit("open", node.id, event);
     return;
   }
   lastPick = { id: node.id, time: now };
@@ -863,7 +886,7 @@ function pointerInGraph(event: PointerEvent | MouseEvent): { x: number; y: numbe
 }
 
 function onBackgroundDown(event: PointerEvent) {
-  if (event.button !== 0 || event.ctrlKey || event.metaKey) return;
+  if (event.button !== 0 || pans(event)) return;
   const origin = pointerInGraph(event);
   if (!origin || !root) return;
 

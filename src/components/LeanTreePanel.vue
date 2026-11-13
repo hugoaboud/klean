@@ -15,7 +15,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   pick: [string, boolean];
-  open: [string];
+  open: [string, MouseEvent];
   selectMany: [string[]];
   create: [];
   delete: [string];
@@ -82,7 +82,7 @@ const target = computed(() => {
         :selected-ids="selectedIds"
         :status-kinds="['lib', 'folder', 'file']"
         @pick="onPick"
-        @open="emit('open', $event)"
+        @open="(id: string, event: MouseEvent) => emit('open', id, event)"
         @select-many="emit('selectMany', $event)"
       />
     </div>

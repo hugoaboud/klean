@@ -21,6 +21,8 @@ export interface TreeNode {
 
 export interface DiagnosticDto {
   line: number;
+  /** 1-based line it ends on: a diagnostic can cover several lines. */
+  end_line: number;
   severity: string;
   message: string;
 }
@@ -130,6 +132,19 @@ export interface UpdateResult {
   processing: boolean;
 }
 
+/** How the pre-welcome warm-up stands (Lean's parser, mostly). */
+export interface StartupState {
+  label: string;
+  done: number;
+  total: number;
+  finished: boolean;
+  error: string | null;
+  seconds: number;
+}
+
+/** Polled by the splash screen while Lean's parser is being prepared. */
+export const startupState = () => invoke<StartupState>("startup_state");
+
 // Opening returns a summary, not a board: nothing has been parsed at that point.
 export const openProject = (path: string) =>
   invoke<ProjectSummary>("open_project", { path });
@@ -234,7 +249,7 @@ export interface LogicGraph {
 export interface SettingNode {
   id: string;
   label: string;
-  kind: "group" | "bool" | "enum" | "text" | "action";
+  kind: "group" | "bool" | "enum" | "text" | "action" | "key";
   value: string;
   options: string[];
   help: string;
@@ -430,6 +445,19 @@ export const leanGoals = (id: string, line?: number, character?: number) =>
 /** The type of the term at a position, as Lean renders it. */
 export const leanHover = (id: string, line?: number, character?: number) =>
   invoke<string | null>("lean_hover", { id, line: line ?? null, character: character ?? null });
+
+/** One completion Lean offered (`textDocument/completion`). */
+export interface Completion {
+  label: string;
+  /** LSP `CompletionItemKind`, the numbering the editor's own list uses. */
+  kind: number;
+  detail: string;
+  documentation: string;
+}
+
+/** What Lean offers to complete at a position inside a node's text. */
+export const leanCompletions = (id: string, line: number, character: number) =>
+  invoke<Completion[]>("lean_completions", { id, line, character });
 
 /** Downloads elan + the configured channel; resolves with the `lean` path. */
 export const leanInstall = () => invoke<string>("lean_install");

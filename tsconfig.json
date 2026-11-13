@@ -1,10 +1,12 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
+    "target": "ES2022",
     "useDefineForClassFields": true,
     "module": "ESNext",
-    "lib": ["ES2020", "DOM"],
+    "lib": ["ES2022", "DOM"],
     "skipLibCheck": true,
+    /* The editor's model has tests that run under node (`npm test`). */
+    "types": ["node"],
 
     /* Bundler mode */
     "moduleResolution": "bundler",

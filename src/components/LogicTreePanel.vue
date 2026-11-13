@@ -19,7 +19,7 @@ defineProps<{
 
 const emit = defineEmits<{
   pick: [string, boolean];
-  open: [string];
+  open: [string, MouseEvent];
   openTheory: [string];
   selectMany: [string[]];
   assign: [ids: string[], target: string | null];
@@ -51,7 +51,7 @@ const treeRef = ref<InstanceType<typeof UiTree> | null>(null);
         :banding="false"
         :drop-kinds="['theory', 'unassigned']"
         @pick="(id: string, additive: boolean) => emit('pick', id, additive)"
-        @open="emit('open', $event)"
+        @open="(id: string, event: MouseEvent) => emit('open', id, event)"
         @open-theory="emit('openTheory', $event)"
         @select-many="emit('selectMany', $event)"
         @drop="

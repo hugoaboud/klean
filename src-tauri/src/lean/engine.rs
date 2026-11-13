@@ -24,7 +24,7 @@ use serde::Serialize;
 use super::ast::{self, Diagnostic, ParsedFile};
 use super::build::{self, Build, BuildState};
 use super::error::{LeanError, LeanResult};
-use super::lsp::{Client, Goals};
+pub use super::lsp::{Client, Completion, Goals};
 use super::toolchain::{self, LeanSettings, Toolchain};
 use lean4_ast::{Options, ParseRequest};
 
@@ -97,6 +97,32 @@ pub struct Engine {
 
     /// The `lake build` job, while one has been started for this project.
     build: Option<Build>,
+}
+
+/// Where the parser should look for modules: the toolchain's own, plus a project's
+/// build output when there is a project.
+pub fn parser_options_for(toolchain: &Toolchain, root: Option<&Path>) -> LeanResult<Options> {
+    let lib = toolchain.library_directory().ok_or_else(|| {
+        LeanError::msg(format!(
+            "cannot find Lean's libraries next to {}",
+            toolchain.lean.display()
+        ))
+    })?;
+    let mut options = Options::new(&lib);
+    // `lake build` output first: a project's own modules win over nothing, and Lean
+    // reads them like any other module directory. An archive has no build output to
+    // add — the toolchain's own modules are all it needs.
+    if let Some(root) = root {
+        for candidate in [
+            root.join(".lake/build/lib/lean"),
+            root.join(".lake/build/lib"),
+        ] {
+            if candidate.is_dir() {
+                options.search_path.push(candidate);
+            }
+        }
+    }
+    Ok(options)
 }
 
 impl Engine {
@@ -245,29 +271,7 @@ impl Engine {
     /// Cheap enough to ask for on its own: building the environment for these is
     /// the expensive part, and that happens on the first parse.
     pub fn parser_options(&self) -> LeanResult<Options> {
-        let root = self.root.clone();
-        let toolchain = self.toolchain()?.clone();
-        let lib = toolchain.library_directory().ok_or_else(|| {
-            LeanError::msg(format!(
-                "cannot find Lean's libraries next to {}",
-                toolchain.lean.display()
-            ))
-        })?;
-        let mut options = Options::new(&lib);
-        // `lake build` output first: a project's own modules win over nothing,
-        // and Lean reads them like any other module directory. An archive has no
-        // build output to add — the toolchain's own modules are all it needs.
-        if let Some(root) = root {
-            for candidate in [
-                root.join(".lake/build/lib/lean"),
-                root.join(".lake/build/lib"),
-            ] {
-                if candidate.is_dir() {
-                    options.search_path.push(candidate);
-                }
-            }
-        }
-        Ok(options)
+        parser_options_for(self.toolchain()?, self.root.as_deref())
     }
 
     /// `lake env lean --stdin --json`, rooted at the project.
@@ -404,6 +408,22 @@ impl Engine {
         let timeout = Duration::from_secs(self.settings.timeout);
         let client = self.client()?;
         client.hover(absolute, source, line, character, timeout)
+    }
+
+    /// What Lean offers to complete at a position: 1-based line, UTF-16 column.
+    pub fn completions(
+        &mut self,
+        absolute: &Path,
+        source: &str,
+        line: u32,
+        character: u32,
+    ) -> LeanResult<Vec<Completion>> {
+        if !self.settings.enabled {
+            return Err(LeanError::msg("Lean integration is switched off"));
+        }
+        let timeout = Duration::from_secs(self.settings.timeout);
+        let client = self.client()?;
+        client.completions(absolute, source, line, character, timeout)
     }
 
     /// Goals at a position: 1-based line, 0-based UTF-16 column.

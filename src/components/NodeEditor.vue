@@ -1,24 +1,24 @@
 <script setup lang="ts">
-// Body of the editor modal: doc block, rename field, code editor, and the
-// right-hand panel that shows what Lean says — the goals left to prove and the
-// errors and warnings inside this node.
+// Body of one editor pane: the code, the comments above it, and the panel that
+// shows what Lean says — the goals left to prove and the errors it found.
 //
-// Typing is checked, not saved. Every pause sends the edited declaration to Rust,
-// which splices it into the file *in memory* and hands it to Lean: diagnostics come
-// back without a write. The file on disk changes only when the user saves
-// (Ctrl/Cmd+S), and closing with unsaved changes asks first.
+// Typing is checked, not saved. A pause (Settings → Editor → Check Debounce) sends
+// the edited declaration to Rust, which splices it into the file *in memory* and
+// hands it to Lean: diagnostics come back without a write. The disk changes only
+// when the user saves (Ctrl/Cmd+S), and closing with unsaved changes asks first.
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import hljs from "../lib/highlight";
 import type { Goals, NodeDetail } from "../api/lean";
+import type { EditorKeys } from "./ui/CodeEditor.vue";
+import CodeEditor from "./ui/CodeEditor.vue";
 import UiButton from "./ui/UiButton.vue";
-import UiCodeEditor from "./ui/UiCodeEditor.vue";
 import UiIcon from "./ui/UiIcon.vue";
 import UiSpinner from "./ui/UiSpinner.vue";
 
 const props = defineProps<{
   detail: NodeDetail | null;
   saving: boolean;
-  saveError: string | null;
+  error: string | null;
   /** Goals at the caret, from Lean's language server. */
   goals: Goals | null;
   goalsBusy: boolean;
@@ -29,6 +29,23 @@ const props = defineProps<{
   termBusy?: boolean;
   /** The prompt row only exists when AI features are switched on. */
   aiEnabled?: boolean;
+  /** How long typing has to pause before Lean is asked (ms). */
+  debounce?: number;
+  /** The shortcut combinations, as configured. */
+  keys?: EditorKeys;
+  /** The editor holds more than one caret. */
+  multi?: boolean;
+  /** Goals of the whole declaration, not of the caret: what the icon shows. */
+  nodeGoals?: Goals | null;
+  /** A background step that is taking a while, e.g. re-reading the board. */
+  busy?: string | null;
+  /** The pane is fetching the node it was pointed at; the old one is still shown. */
+  loading?: boolean;
+  /**
+   * Another editor of the same file holds an unsaved edit: this one reads only,
+   * until that is saved or thrown away.
+   */
+  locked?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -41,20 +58,30 @@ const emit = defineEmits<{
   /** Put the saved text back, in front of Lean too. */
   revert: [];
   comments: [string];
-  rename: [string];
   file: [];
   /** Caret moved: file-absolute 1-based line, UTF-16 column. */
   goals: [number, number];
+  /** Ask Lean for the goals at the end of this declaration. */
+  refreshGoals: [];
   /** Ask the AI about this node: an AI session seeded with it. */
   prompt: [string];
+  /** How many selections the editor holds (more than one means several carets). */
+  selections: [number];
 }>();
 
 const text = ref("");
 const comments = ref("");
-
 const prompt = ref("");
 const commentsBox = ref<HTMLTextAreaElement | null>(null);
+/** The right-hand panel (term, proof state, diagnostics) on or off. */
+const sideVisible = ref(true);
 const promptBox = ref<HTMLTextAreaElement | null>(null);
+
+/** The state panel is shown for proofs; the term stays available above it. */
+const isTheorem = computed(() => {
+  const kind = props.detail?.kind ?? "";
+  return kind === "theorem" || kind === "lemma";
+});
 
 /** Textareas grow with their content, up to a limit, then scroll. */
 function grow(box: HTMLTextAreaElement | null, limit: number) {
@@ -68,28 +95,40 @@ onMounted(() => {
   grow(commentsBox.value, 190);
   grow(promptBox.value, 120);
 });
-const name = ref("");
+
 const dirty = ref(false);
 let timer: number | undefined;
 
 watch(dirty, (value) => emit("dirty", value));
 
-const editable = computed(() => props.detail?.editable ?? false);
+const editable = computed(() => (props.detail?.editable ?? false) && !props.locked);
+/** What the footer says, and whether it is spinning. */
+const status = computed(() => {
+  if (props.error) return { tone: "error", label: props.error, busy: false };
+  if (props.saving) return { tone: "busy", label: "saving…", busy: true };
+  if (props.loading) return { tone: "busy", label: "opening…", busy: true };
+  if (props.locked)
+    return {
+      tone: "dirty",
+      label: "another editor of this file has unsaved changes",
+      busy: false,
+    };
+  if (props.processing) return { tone: "busy", label: "lean is checking…", busy: true };
+  if (props.busy) return { tone: "busy", label: `${props.busy}…`, busy: true };
+  if (!editable.value) return { tone: "muted", label: "read only", busy: false };
+  if (dirty.value) return { tone: "dirty", label: "unsaved — checked in memory", busy: false };
+  return { tone: "ok", label: "saved", busy: false };
+});
+
+/** What Lean reported, on the file's own lines: the editor paints them. */
 const markers = computed(() =>
   (props.detail?.diagnostics ?? []).map((diagnostic) => ({
-    line: diagnostic.line - (props.detail?.start_line ?? 1) + 1,
+    line: diagnostic.line,
+    end_line: diagnostic.end_line,
     severity: diagnostic.severity,
+    message: diagnostic.message,
   })),
 );
-const canRename = computed(() => editable.value && Boolean(props.detail?.renamable));
-const status = computed(() => {
-  if (!editable.value) return { tone: "muted", label: "read only" };
-  if (props.saveError) return { tone: "error", label: props.saveError };
-  if (props.processing) return { tone: "busy", label: "lean is checking…" };
-  if (props.saving) return { tone: "busy", label: "saving…" };
-  if (dirty.value) return { tone: "dirty", label: "unsaved — checked in memory" };
-  return { tone: "ok", label: "saved" };
-});
 
 /** Errors and warnings inside the node, worst first. */
 const diagnostics = computed(() => {
@@ -100,6 +139,29 @@ const diagnostics = computed(() => {
 });
 
 const goalLines = computed(() => props.goals?.goals ?? []);
+
+/**
+ * The proof state of the *declaration*, for the icon beside the comments.
+ *
+ * It comes from the goals at the end of the declaration, not from the caret: a
+ * theorem that is proved stays green while the caret sits on an intermediate
+ * tactic line, where there are goals to show.
+ */
+const proofState = computed(() => {
+  const goals = props.nodeGoals;
+  if (!goals) return { tone: "idle", text: "⊢", title: "Lean has not answered for this node yet" };
+  if (goals.goals.length === 0) {
+    return { tone: "done", text: "⊢", title: goals.note ?? "no goals left: the declaration is proved" };
+  }
+  return {
+    tone: "open",
+    text: String(goals.goals.length),
+    title: `${goals.goals.length} goal${goals.goals.length === 1 ? "" : "s"} left at the end of the declaration`,
+  };
+});
+
+/** A file has no file to open, and no terms of its own to hover. */
+const isFile = computed(() => (props.detail?.kind ?? "") === "file");
 
 /** Lean snippets in the state panel, coloured with the editor's own grammar. */
 function highlighted(code: string): string {
@@ -116,14 +178,14 @@ const termCode = computed(() => {
   return text
     .replace(/```[a-zA-Z]*\n?/g, "")
     .split("\n")
-    .map((line) => line.replace(/^\s{2,}/, (indent) => indent.length >= 2 ? "" : indent))
+    .map((line) => line.replace(/^\s{2,}/, (indent) => (indent.length >= 2 ? "" : indent)))
     .join("\n")
     .trim();
 });
 
 /**
  * The width of the state column, dragged by the divider. Kept in the component:
- * it is view state, and the modal remembers it for as long as it is open.
+ * it is view state, and the pane remembers it for as long as it is open.
  */
 const sideWidth = ref(230);
 let dragStart: { x: number; width: number } | null = null;
@@ -154,7 +216,6 @@ watch(
     window.clearTimeout(timer);
     text.value = props.detail?.text ?? "";
     comments.value = props.detail?.comments ?? "";
-    name.value = props.detail?.name ?? "";
     dirty.value = false;
     // Boxes grow to fit whatever the node already carries.
     nextTick(() => {
@@ -179,10 +240,10 @@ function onInput(value: string) {
   text.value = value;
   if (!editable.value) return;
   dirty.value = true;
-  // Check as the user types: Lean gets the text long before the disk does, so the
-  // goals and the errors follow the caret instead of the save button.
+  // Check once the user stops typing: Lean gets the text long before the disk does,
+  // so the goals and the errors follow the caret instead of the save button.
   window.clearTimeout(timer);
-  timer = window.setTimeout(check, 150);
+  timer = window.setTimeout(check, props.debounce ?? 300);
 }
 
 /** Sends the text for checking. Cheap: one node, no disk, no project walk. */
@@ -245,16 +306,6 @@ function flushComments() {
   emit("comments", comments.value);
 }
 
-function commitName() {
-  const current = props.detail?.name ?? "";
-  const next = name.value.trim();
-  if (!next) {
-    name.value = current;
-    return;
-  }
-  if (next !== current) emit("rename", next);
-}
-
 onBeforeUnmount(() => {
   window.clearTimeout(timer);
   window.clearTimeout(commentTimer);
@@ -262,43 +313,27 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div v-if="detail" class="node-editor">
+  <div v-if="!detail" class="node-editor node-editor--empty">
+    <div class="node-editor__placeholder">
+      <UiSpinner v-if="!error" :size="12" />
+      <UiIcon v-else name="alert" :size="12" />
+      <span>{{ error ?? "opening…" }}</span>
+    </div>
+  </div>
+
+  <div v-else class="node-editor">
     <div class="node-editor__body">
       <div class="node-editor__main">
-        <div class="node-editor__meta">
-          <div class="node-editor__facts">
-            <span class="k-label">lines</span>
-            <span class="k-mono">{{ detail.start_line }}–{{ detail.end_line }}</span>
-            <span class="node-editor__sep">·</span>
-            <span class="k-label">path</span>
-            <span class="k-mono node-editor__path">{{ detail.path ?? "—" }}</span>
-          </div>
-          <div v-if="canRename" class="node-editor__rename">
-            <span class="k-label">name</span>
-            <input
-              v-model="name"
-              class="node-editor__input k-mono"
-              spellcheck="false"
-              @keydown.enter.prevent="commitName"
-              @blur="commitName"
-            />
-            <UiButton size="sm" variant="subtle" title="Rename the declaration" @click="commitName">
-              rename
-            </UiButton>
-          </div>
-        </div>
-
         <blockquote v-if="detail.doc" class="node-editor__doc">{{ detail.doc }}</blockquote>
 
         <div v-if="detail.editable" class="node-editor__comments">
-          <span class="k-label">comments</span>
           <textarea
-            class="node-editor__comments-input k-mono"
             ref="commentsBox"
+            class="node-editor__comments-input k-mono"
             :value="comments"
             rows="1"
             spellcheck="false"
-            placeholder="-- plain comments directly above this declaration"
+            placeholder="-- no comments"
             @input="
               onCommentsInput(($event.target as HTMLTextAreaElement).value);
               grow(commentsBox, 190);
@@ -307,16 +342,49 @@ onBeforeUnmount(() => {
             @keydown.ctrl.s.prevent="flushComments"
             @keydown.meta.s.prevent="flushComments"
           />
+          <!-- The panel on the right, on or off. It is the last thing in this row,
+               after the proof state, so the eye finds both where it writes. -->
+          <button
+            class="node-editor__panel"
+            type="button"
+            :title="sideVisible ? 'Hide the term and proof state panel' : 'Show the term and proof state panel'"
+            :aria-pressed="sideVisible"
+            :data-on="sideVisible || undefined"
+            @click="sideVisible = !sideVisible"
+          >
+            <UiIcon name="outline" :size="11" />
+          </button>
+          <!-- On a theorem, the proof state sits with the comments, where the eye
+               already is while writing the declaration. -->
+          <button
+            v-if="isTheorem"
+            class="node-editor__proof"
+            :data-tone="proofState.tone"
+            :title="proofState.title"
+            type="button"
+            @click="emit('refreshGoals')"
+          >
+            <span class="node-editor__proof-glyph">⊢</span>
+            <span v-if="proofState.text !== '⊢'" class="node-editor__proof-count k-mono">
+              {{ proofState.text }}
+            </span>
+            <UiSpinner v-if="goalsBusy" :size="9" />
+          </button>
         </div>
 
         <div class="node-editor__code">
-          <UiCodeEditor
+          <CodeEditor
             v-if="detail.editable"
             :model-value="text"
+            :doc-id="detail.id"
+            :readonly="!editable"
             language="lean"
+            :start-line="detail.start_line"
             :markers="markers"
+            :keys="keys"
             @update:model-value="onInput"
             @caret="onCaret"
+            @selections="(count: number) => emit('selections', count)"
             @commit="save"
           />
           <pre v-else class="node-editor__readonly">{{ detail.text }}</pre>
@@ -329,7 +397,7 @@ onBeforeUnmount(() => {
             class="node-editor__prompt-input k-mono"
             rows="1"
             spellcheck="false"
-            placeholder="ask for a change to this node…"
+            placeholder="What do you need?"
             @input="grow(promptBox, 120)"
           />
           <UiButton size="sm" variant="solid" :disabled="!prompt.trim()" @click="sendPrompt">
@@ -339,6 +407,7 @@ onBeforeUnmount(() => {
       </div>
 
       <div
+        v-if="sideVisible"
         class="node-editor__divider"
         title="Drag to resize the state panel"
         role="separator"
@@ -349,14 +418,16 @@ onBeforeUnmount(() => {
         @pointercancel="endDrag"
       />
 
-      <aside class="node-editor__side" :style="{ width: `${sideWidth}px` }">
+      <aside v-if="sideVisible" class="node-editor__side" :style="{ width: `${sideWidth}px` }">
         <div class="node-editor__section">
           <span class="k-label">
             term
-            <UiSpinner v-if="termBusy" :size="9" />
+            <UiSpinner v-if="termBusy && !multi" :size="9" />
           </span>
+          <!-- Several carets are several terms: there is no single type to ask. -->
+          <p v-if="multi" class="node-editor__hint">multiple terms</p>
           <pre
-            v-if="termCode"
+            v-else-if="termCode"
             class="node-editor__goal hljs"
             v-html="highlighted(termCode)"
           />
@@ -365,7 +436,8 @@ onBeforeUnmount(() => {
           </p>
         </div>
 
-        <div class="node-editor__section">
+        <!-- A proof state belongs to proofs: declarations have nothing to prove. -->
+        <div v-if="isTheorem" class="node-editor__section">
           <span class="k-label">
             proof state
             <UiSpinner v-if="goalsBusy" :size="9" />
@@ -394,6 +466,7 @@ onBeforeUnmount(() => {
               :key="index"
               class="node-editor__diagnostic"
               :data-severity="diagnostic.severity"
+              @click="emit('goals', diagnostic.line, 0)"
             >
               <span class="k-mono">{{ diagnostic.line }}</span>
               <span class="node-editor__message">{{ diagnostic.message }}</span>
@@ -406,7 +479,7 @@ onBeforeUnmount(() => {
 
     <footer class="node-editor__bar">
       <span class="node-editor__status" :data-tone="status.tone">
-        <UiSpinner v-if="saving || processing" :size="9" />
+        <UiSpinner v-if="status.busy" :size="9" />
         <UiIcon v-else name="dot" :size="10" />
         {{ status.label }}
       </span>
@@ -414,11 +487,18 @@ onBeforeUnmount(() => {
       <UiButton v-if="detail.editable" size="sm" variant="ghost" :disabled="!dirty" @click="revert">
         revert
       </UiButton>
-      <UiButton size="sm" variant="ghost" @click="emit('file')" title="Show the file this term comes from">
+      <UiButton
+        v-if="!isFile"
+        size="sm"
+        variant="ghost"
+        title="Open the file this node comes from"
+        @click="emit('file')"
+      >
         <UiIcon name="outline" :size="11" /> file
       </UiButton>
       <UiButton
         v-if="detail.editable"
+        class="node-editor__save"
         size="sm"
         variant="solid"
         :disabled="!dirty"
@@ -426,6 +506,7 @@ onBeforeUnmount(() => {
         @click="save"
       >
         <UiIcon name="save" :size="11" /> save
+        <span v-if="dirty" class="node-editor__badge" aria-hidden="true" />
       </UiButton>
     </footer>
   </div>
@@ -458,25 +539,22 @@ onBeforeUnmount(() => {
 }
 
 .node-editor__divider {
-  width: 7px;
-  flex: 0 0 auto;
-  cursor: col-resize;
-  border-radius: 3px;
+  flex: 0 0 5px;
+  border-radius: 2px;
   background: transparent;
-  transition: background-color var(--t) var(--ease);
+  cursor: col-resize;
 }
 
 .node-editor__divider:hover {
-  background: var(--accent-soft, rgba(120, 160, 210, 0.16));
+  background: var(--line-soft);
 }
 
 .node-editor__side {
   display: flex;
   flex-direction: column;
   min-width: 160px;
-  gap: 8px;
-  padding-left: 8px;
-  border-left: 1px solid var(--line);
+  min-height: 0;
+  gap: 10px;
   overflow: auto;
 }
 
@@ -487,13 +565,8 @@ onBeforeUnmount(() => {
 }
 
 .node-editor__section--grow {
+  flex: 1;
   min-height: 0;
-}
-
-.node-editor__section > .k-label {
-  display: flex;
-  align-items: center;
-  gap: 5px;
 }
 
 /* The state panel is read at a glance while typing, so it runs a step larger than
@@ -545,72 +618,115 @@ onBeforeUnmount(() => {
   line-height: 1.5;
 }
 
-.node-editor__meta {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  flex-wrap: wrap;
-}
-
-.node-editor__facts {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-
-.node-editor__facts :deep(.k-mono) {
-  color: var(--text-faint);
-  font-size: 10px;
-}
-
-.node-editor__path {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 260px;
-}
-
-.node-editor__sep {
-  color: var(--text-ghost);
-}
-
-.node-editor__rename {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.node-editor__input {
-  width: 150px;
-  height: 21px;
-  padding: 0 6px;
-  border: 1px solid var(--line);
-  border-radius: 2px;
-  background: var(--bg-1);
-  color: var(--text);
-  font-size: 10.5px;
-  transition: border-color var(--t) var(--ease), background-color var(--t) var(--ease);
-}
-
-.node-editor__input:focus {
-  border-color: var(--accent-line);
-  background: var(--bg-2);
-}
-
 .node-editor__doc {
   margin: 0;
   padding: 6px 9px;
   border-left: 2px solid var(--line-strong);
-  background: rgba(255, 255, 255, 0.012);
-  border-radius: 0 2px 2px 0;
-  color: var(--text-faint);
+  background: rgba(255, 255, 255, 0.015);
+  color: var(--text-dim);
   font-size: var(--fs-xs);
-  font-family: var(--mono);
-  line-height: 1.55;
-  max-height: 76px;
-  overflow: auto;
+  line-height: 1.5;
   white-space: pre-wrap;
+}
+
+.node-editor__comments {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.node-editor__comments-input {
+  flex: 1;
+  min-height: 24px;
+  padding: 4px 7px;
+  border: 1px solid var(--line-soft);
+  border-radius: 2px;
+  resize: none;
+  outline: none;
+  background: var(--bg-0);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+
+.node-editor__comments-input::placeholder {
+  /* Darker than the text it stands in for: a hint, not content. */
+  color: var(--text-ghost);
+  opacity: 0.55;
+}
+
+.node-editor__comments-input:focus {
+  border-color: var(--accent-line);
+}
+
+/* The panel toggle, the last control in the comments row. */
+.node-editor__panel {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--line-soft);
+  border-radius: 2px;
+  background: var(--bg-0);
+  color: var(--text-ghost);
+  cursor: pointer;
+}
+
+.node-editor__panel:hover {
+  color: var(--text);
+  border-color: var(--line-strong);
+}
+
+.node-editor__panel[data-on] {
+  color: var(--accent);
+  border-color: var(--accent-line);
+}
+
+/* The proof state, beside the comments of a theorem. */
+.node-editor__proof {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: 2px;
+  background: var(--bg-0);
+  color: var(--text-ghost);
+  font-size: var(--fs-micro);
+  cursor: pointer;
+}
+
+.node-editor__proof[data-tone="open"] {
+  border-color: rgba(194, 166, 112, 0.4);
+  color: var(--warning);
+}
+
+.node-editor__proof[data-tone="done"] {
+  border-color: rgba(126, 176, 138, 0.4);
+  color: var(--ok);
+}
+
+.node-editor__proof-glyph {
+  font-size: var(--fs-xs);
+}
+
+.node-editor__proof-count {
+  font-variant-numeric: tabular-nums;
+}
+
+.node-editor--empty {
+  align-items: center;
+  justify-content: center;
+}
+
+.node-editor__placeholder {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-ghost);
+  font-size: var(--fs-xs);
 }
 
 .node-editor__code {
@@ -622,15 +738,16 @@ onBeforeUnmount(() => {
 .node-editor__readonly {
   flex: 1;
   margin: 0;
-  padding: 10px 12px;
+  padding: 8px 10px;
+  overflow: auto;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: #0c0e10;
   color: var(--text-dim);
   font-family: var(--mono);
   font-size: var(--fs-sm);
-  line-height: 1.55;
-  overflow: auto;
+  line-height: 18px;
+  white-space: pre;
 }
 
 .node-editor__diagnostics {
@@ -647,6 +764,11 @@ onBeforeUnmount(() => {
   background: rgba(194, 166, 112, 0.03);
   font-size: var(--fs-xs);
   color: var(--text-faint);
+  cursor: pointer;
+}
+
+.node-editor__diagnostic:hover {
+  background: rgba(194, 166, 112, 0.08);
 }
 
 .node-editor__diagnostic[data-severity="error"] {
@@ -676,71 +798,46 @@ onBeforeUnmount(() => {
 
 .node-editor__prompt-input {
   flex: 1;
-  min-height: 28px;
+  min-height: 26px;
   padding: 5px 8px;
-  overflow: hidden;
-  resize: none;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: var(--bg-1);
+  resize: none;
+  outline: none;
+  background: var(--bg-0);
   color: var(--text);
+  font-family: var(--mono);
   font-size: var(--fs-xs);
   line-height: 1.5;
+}
+
+.node-editor__prompt-input::placeholder {
+  /* Darker than the text it stands in for: a hint, not content. */
+  color: var(--text-ghost);
+  opacity: 0.55;
 }
 
 .node-editor__prompt-input:focus {
   border-color: var(--accent-line);
-  background: var(--bg-2);
-}
-
-.node-editor__comments {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.node-editor__comments-input {
-  overflow: hidden;
-  resize: vertical;
-  min-height: 34px;
-  max-height: 90px;
-  padding: 6px 8px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: #0c0e10;
-  color: var(--text-dim);
-  font-size: var(--fs-xs);
-  line-height: 1.5;
-}
-
-.node-editor__comments-input:focus {
-  border-color: var(--accent-line);
-  color: var(--text);
 }
 
 .node-editor__bar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  height: 36px;
-  margin: 0 -12px;
-  padding: 0 12px;
-  border-top: 1px solid var(--line);
-  background: linear-gradient(180deg, #121517 0%, #0f1113 100%);
+  gap: 6px;
+  padding: 6px 0 8px;
 }
 
 .node-editor__status {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 5px;
   font-size: var(--fs-micro);
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
   color: var(--text-ghost);
 }
 
 .node-editor__status[data-tone="ok"] {
-  color: var(--ok);
+  color: var(--text-faint);
 }
 
 .node-editor__status[data-tone="dirty"] {
@@ -751,11 +848,19 @@ onBeforeUnmount(() => {
   color: var(--danger);
 }
 
-.node-editor__status[data-tone="busy"] {
-  color: var(--accent);
+/* A dot on the save button: there is something the disk does not have yet. */
+.node-editor__save {
+  position: relative;
 }
 
-.node-editor__status[data-tone="muted"] {
-  color: var(--text-ghost);
+.node-editor__badge {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--warning);
+  box-shadow: 0 0 0 1px var(--bg-0);
 }
 </style>

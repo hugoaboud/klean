@@ -15,11 +15,42 @@ const props = withDefaults(
     badge?: string;
     /** Show a corner grip that lets the user resize the modal. */
     resizable?: boolean;
+    /** Stacking order among the modals that are open together. */
+    layer?: number;
+    /** True for the modal the user last touched: it reads as the live one. */
+    active?: boolean;
+    /**
+     * Where to open. Without one the modal centres itself; with one — the place the
+     * last closed modal had, or a step out from the one beside it — it opens there.
+     */
+    geometry?: { x: number; y: number; w: number; h: number } | null;
+    /**
+     * Whether Escape closes this modal. The editor turns it off: an editor is
+     * closed on purpose (Ctrl+W, or the ✕), never by a key pressed while thinking.
+     */
+    closeOnEscape?: boolean;
   }>(),
-  { title: "", subtitle: "", width: 780, height: 580, badge: "", resizable: false },
+  {
+    title: "",
+    subtitle: "",
+    width: 780,
+    height: 580,
+    badge: "",
+    resizable: false,
+    layer: 0,
+    active: true,
+    geometry: null,
+    closeOnEscape: true,
+  },
 );
 
-const emit = defineEmits<{ close: [] }>();
+const emit = defineEmits<{
+  close: [];
+  /** The user clicked or dragged this modal: it is the one that takes input. */
+  focus: [];
+  /** Where the modal ended up, so the next one can be placed relative to it. */
+  geometry: [{ x: number; y: number; w: number; h: number }];
+}>();
 
 const pos = reactive({ x: 0, y: 0 });
 const dragging = ref(false);
@@ -27,18 +58,36 @@ const size = reactive({ w: 0, h: 0 });
 const drag = { x: 0, y: 0, ox: 0, oy: 0 };
 
 function measure() {
+  if (props.geometry) {
+    // A remembered size, kept inside the window it is opened in.
+    size.w = Math.min(props.geometry.w, Math.max(360, window.innerWidth - 96));
+    size.h = Math.min(props.geometry.h, Math.max(260, window.innerHeight - 96));
+    return;
+  }
   size.w = Math.min(props.width, Math.max(360, window.innerWidth - 96));
   size.h = Math.min(props.height, Math.max(260, window.innerHeight - 96));
 }
 
 function centre() {
   measure();
-  pos.x = Math.round((window.innerWidth - size.w) / 2);
-  pos.y = Math.round((window.innerHeight - size.h) / 2);
+  if (props.geometry) {
+    pos.x = Math.max(0, Math.min(props.geometry.x, window.innerWidth - size.w));
+    pos.y = Math.max(0, Math.min(props.geometry.y, window.innerHeight - 44));
+  } else {
+    pos.x = Math.round((window.innerWidth - size.w) / 2);
+    pos.y = Math.round((window.innerHeight - size.h) / 2);
+  }
+  report();
+}
+
+/** Tells the caller where the modal is, after it moved, resized or opened. */
+function report() {
+  emit("geometry", { x: pos.x, y: pos.y, w: size.w, h: size.h });
 }
 
 function onPointerDown(event: PointerEvent) {
   if (event.button !== 0) return;
+  emit("focus");
   dragging.value = true;
   drag.x = event.clientX;
   drag.y = event.clientY;
@@ -58,6 +107,7 @@ function onPointerMove(event: PointerEvent) {
 }
 
 function onPointerUp() {
+  if (dragging.value) report();
   dragging.value = false;
   detach();
 }
@@ -68,7 +118,7 @@ function detach() {
 }
 
 function onKeydown(event: KeyboardEvent) {
-  if (event.key === "Escape") emit("close");
+  if (event.key === "Escape" && props.closeOnEscape) emit("close");
 }
 
 function onResizeDown(event: PointerEvent) {
@@ -87,6 +137,7 @@ function onResizeDown(event: PointerEvent) {
   const up = () => {
     window.removeEventListener("pointermove", move);
     window.removeEventListener("pointerup", up);
+    report();
   };
   window.addEventListener("pointermove", move);
   window.addEventListener("pointerup", up);
@@ -117,12 +168,21 @@ const style = computed(() => ({
   top: pos.y + "px",
   width: size.w + "px",
   height: size.h + "px",
+  zIndex: String(40 + props.layer),
 }));
 </script>
 
 <template>
   <Transition name="k-modal">
-    <div v-if="open" class="ui-modal" :style="style" :data-dragging="dragging || undefined" role="dialog">
+    <div
+      v-if="open"
+      class="ui-modal"
+      :style="style"
+      :data-dragging="dragging || undefined"
+      :data-active="active ? 1 : undefined"
+      role="dialog"
+      @pointerdown="emit('focus')"
+    >
       <header class="ui-modal__bar" @pointerdown="onPointerDown">
         <span class="ui-modal__grip"><UiIcon name="drag" :size="11" /></span>
         <div class="ui-modal__id">
@@ -156,6 +216,8 @@ const style = computed(() => ({
 <style scoped>
 .ui-modal {
   position: fixed;
+  /* `style` carries the stacking order: modals open together and the one the user
+     last touched sits above the others. */
   z-index: 40;
   display: flex;
   flex-direction: column;

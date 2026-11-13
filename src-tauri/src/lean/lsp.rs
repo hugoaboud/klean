@@ -39,6 +39,16 @@ pub struct Goals {
     pub note: Option<String>,
 }
 
+/// One completion Lean offered: its label, the LSP kind (a number, which is what
+/// the editor's own list wants) and the type the item carries, when it has one.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Completion {
+    pub label: String,
+    pub kind: u32,
+    pub detail: String,
+    pub documentation: String,
+}
+
 /// What the worker knows right now: everything the UI needs to show progress.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
@@ -67,6 +77,13 @@ enum Task {
         line: u32,
         character: u32,
         reply: Sender<Result<Option<String>, String>>,
+    },
+    Completions {
+        path: PathBuf,
+        text: String,
+        line: u32,
+        character: u32,
+        reply: Sender<Result<Vec<Completion>, String>>,
     },
     Stop,
 }
@@ -194,6 +211,36 @@ impl Client {
         }
     }
 
+    /// What Lean offers at a position: its own `textDocument/completion`.
+    ///
+    /// The suggestions are Lean's — its keywords, its tactics, the names in scope and
+    /// the fields of the structures in scope — because they come from the server that
+    /// elaborated the file, not from a list assembled here.
+    pub fn completions(
+        &self,
+        path: &Path,
+        text: &str,
+        line: u32,
+        character: u32,
+        timeout: Duration,
+    ) -> LeanResult<Vec<Completion>> {
+        let (reply, answer) = mpsc::channel();
+        self.sender
+            .send(Task::Completions {
+                path: path.to_path_buf(),
+                text: text.to_string(),
+                line,
+                character,
+                reply,
+            })
+            .map_err(|_| LeanError::msg("the Lean worker is not running"))?;
+        match answer.recv_timeout(timeout) {
+            Ok(Ok(items)) => Ok(items),
+            Ok(Err(message)) => Err(LeanError::msg(message)),
+            Err(_) => Err(LeanError::msg("the Lean server did not answer in time")),
+        }
+    }
+
     pub fn stop(&self) {
         let _ = self.sender.send(Task::Stop);
     }
@@ -240,6 +287,19 @@ fn worker(
                 let result = session
                     .sync(&path, &text)
                     .and_then(|_| session.hover(&path, line, character))
+                    .map_err(|error| error.to_string());
+                let _ = reply.send(result);
+            }
+            Ok(Task::Completions {
+                path,
+                text,
+                line,
+                character,
+                reply,
+            }) => {
+                let result = session
+                    .sync(&path, &text)
+                    .and_then(|_| session.completions(&path, line, character))
                     .map_err(|error| error.to_string());
                 let _ = reply.send(result);
             }
@@ -346,7 +406,14 @@ impl Session {
                 "capabilities": {
                     "textDocument": {
                         "publishDiagnostics": { "relatedInformation": false },
-                        "synchronization": { "didSave": false, "willSave": false }
+                        "synchronization": { "didSave": false, "willSave": false },
+                        "completion": {
+                            "completionItem": {
+                                "snippetSupport": false,
+                                "documentationFormat": ["plaintext", "markdown"]
+                            }
+                        },
+                        "hover": { "contentFormat": ["plaintext", "markdown"] }
                     },
                     "workspace": { "applyEdit": false, "workspaceEdit": { "documentChanges": false } },
                     "window": { "workDoneProgress": false }
@@ -623,6 +690,62 @@ impl Session {
                 })
             }
         }
+    }
+
+    /// `textDocument/completion`, flattened into a list the editor can show.
+    fn completions(&mut self, path: &Path, line: u32, character: u32) -> LeanResult<Vec<Completion>> {
+        let uri = uri_of(path);
+        let result = self.request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line.saturating_sub(1), "character": character },
+                "context": { "triggerKind": 1 }
+            }),
+        )?;
+        // The answer is `CompletionItem[]`, `CompletionList`, or null.
+        let items = match result {
+            Value::Null => Vec::new(),
+            Value::Array(items) => items,
+            Value::Object(object) => match object.get("items") {
+                Some(Value::Array(items)) => items.clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                let label = match item.get("label") {
+                    Some(Value::String(label)) => label.clone(),
+                    Some(Value::Object(object)) => object.get("label")?.as_str()?.to_string(),
+                    _ => return None,
+                };
+                // `CompletionItemKind` is a number in LSP; the editor's list takes
+                // the same numbering, so it goes straight through.
+                let kind = item.get("kind").and_then(Value::as_u64).unwrap_or(1) as u32;
+                let detail = item
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let documentation = match item.get("documentation") {
+                    Some(Value::String(text)) => text.clone(),
+                    Some(Value::Object(object)) => object
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    _ => String::new(),
+                };
+                Some(Completion {
+                    label,
+                    kind,
+                    detail,
+                    documentation,
+                })
+            })
+            .collect())
     }
 
     fn stop(&mut self) {

@@ -26,7 +26,7 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   pick: [string, boolean];
-  open: [string];
+  open: [string, MouseEvent];
   openTheory: [string];
   selectMany: [string[]];
   drop: [ids: string[], target: string];
@@ -195,7 +195,7 @@ defineExpose({
       :draggable="draggable"
       :drop-kinds="dropKinds"
       @pick="onPick"
-      @open="emit('open', $event)"
+      @open="(id: string, event: MouseEvent) => emit('open', id, event)"
       @open-theory="emit('openTheory', $event)"
       @toggle="toggle"
       @drop="(ids: string[], target: string) => emit('drop', ids, target)"

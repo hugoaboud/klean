@@ -9,14 +9,14 @@ import LogicTreePanel from "../components/LogicTreePanel.vue";
 import UiPrompt from "../components/ui/UiPrompt.vue";
 import UiSplitPane from "../components/ui/UiSplitPane.vue";
 import type { LogicGraph, TreeNode } from "../api/lean";
-import { actions, state } from "../store/workspace";
+import { actions, panKey, state } from "../store/workspace";
 
 const props = defineProps<{
   logic: LogicGraph | null;
   selectedIds: string[];
 }>();
 
-const emit = defineEmits<{ open: [string] }>();
+const emit = defineEmits<{ open: [string, Event] }>();
 
 const split = defineModel<number>("split", { default: 0.62 });
 
@@ -137,9 +137,10 @@ function layerTargetY(): number {
         :selected-ids="selectedIds"
         :camera="logic?.camera ?? null"
         :hover-info="state.hover"
+        :pan-key="panKey()"
         @pick="onPick"
         @select="actions.selectMany($event)"
-        @open="emit('open', $event)"
+        @open="(id: string, event: Event) => emit('open', id, event)"
         @open-theory="actions.openTheory($event)"
         @crumb="actions.openTheory($event)"
         @camera="actions.saveCamera('logic', $event)"
@@ -167,7 +168,7 @@ function layerTargetY(): number {
         :uses="links.length"
         :open-theory="theory"
         @pick="onPick"
-        @open="emit('open', $event)"
+        @open="(id: string, event: Event) => emit('open', id, event)"
         @open-theory="actions.openTheory($event)"
         @select-many="actions.selectMany($event)"
         @assign="(ids: string[], target: string | null) => actions.assignTheory(ids, target)"

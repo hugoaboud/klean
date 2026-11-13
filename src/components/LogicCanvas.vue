@@ -11,6 +11,7 @@
 // band, ctrl/cmd + drag to pan, wheel to zoom, double click a theory to open it,
 // right click for the tools (on empty canvas) or Delete (on a theory/divider).
 import * as d3 from "d3";
+import { matchesShortcut } from "../editor/keys";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { Camera, FixedNode, GraphLink, GraphNode, NodeDetail } from "../api/lean";
 import UiIcon from "./ui/UiIcon.vue";
@@ -42,14 +43,16 @@ const props = withDefaults(
     selectedIds: string[];
     camera?: Camera | null;
     hoverInfo?: NodeDetail | null;
+    /** Held while dragging to look around, from `Settings → Editor`. */
+    panKey?: string;
   }>(),
-  { camera: null, hoverInfo: null },
+  { camera: null, hoverInfo: null, panKey: "Ctrl" },
 );
 
 const emit = defineEmits<{
   pick: [string, boolean];
   select: [string[]];
-  open: [string];
+  open: [string, PointerEvent];
   "open-theory": [string];
   crumb: [string];
   move: [FixedNode[]];
@@ -135,6 +138,23 @@ function halfWidth(node: GraphNode): number {
 
 function truncate(text: string, limit: number): string {
   return text.length <= limit ? text : text.slice(0, limit - 1) + "…";
+}
+
+/**
+ * True when this event carries the modifier the user set for looking around the
+ * board by dragging it (`Settings → Editor → Pan the Canvas`).
+ */
+function pans(event: { ctrlKey: boolean; metaKey: boolean; altKey: boolean; shiftKey: boolean }): boolean {
+  return matchesShortcut(
+    {
+      key: "Control",
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      altKey: event.altKey,
+      shiftKey: event.shiftKey,
+    },
+    props.panKey ?? "Ctrl",
+  );
 }
 
 let svg: d3.Selection<SVGSVGElement, unknown, null, undefined> | null = null;
@@ -258,7 +278,7 @@ function mount() {
     .filter((event: Event) => {
       if (event.type === "wheel") return true;
       const mouse = event as MouseEvent;
-      return mouse.type === "mousedown" && (mouse.ctrlKey || mouse.metaKey);
+      return mouse.type === "mousedown" && pans(mouse);
     })
     .on("zoom", (event) => {
       root?.attr("transform", event.transform.toString());
@@ -738,7 +758,9 @@ function release(event: PointerEvent, node: SimNode) {
   if (!state || state.id !== node.id || state.moved) return;
   const additive = event.ctrlKey || event.metaKey || event.shiftKey;
   const now = Date.now();
-  if (!additive && lastPick.id === node.id && now - lastPick.time < 380) {
+  // A double-click opens, modifier or not: the page reads the modifier from the
+  // event to decide between another editor and the pane the user last touched.
+  if (lastPick.id === node.id && now - lastPick.time < 380) {
     lastPick = { id: "", time: 0 };
     if (node.kind === "theory") {
       // The board is about to change underneath: no lingering hover.
@@ -746,7 +768,7 @@ function release(event: PointerEvent, node: SimNode) {
       edgeCard.value = null;
       emit("open-theory", node.key);
     } else {
-      emit("open", node.id);
+      emit("open", node.id, event);
     }
     return;
   }
@@ -763,7 +785,7 @@ function pointerInGraph(event: PointerEvent | MouseEvent): { x: number; y: numbe
 }
 
 function onBackgroundDown(event: PointerEvent) {
-  if (event.button !== 0 || event.ctrlKey || event.metaKey) return;
+  if (event.button !== 0 || pans(event)) return;
   const origin = pointerInGraph(event);
   if (!origin || !root) return;
   // Shift keeps what is selected: the rectangle then adds to it.

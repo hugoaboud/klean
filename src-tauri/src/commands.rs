@@ -12,8 +12,9 @@ use crate::lean::build::BuildState;
 use crate::lean::lsp::Goals;
 use crate::lean::scan::{Scan, ScanState};
 use crate::lean::{
-    FixedNode, LeanStatus, LogicGraph, NodeDetail, PreviewResult, Project, ProjectGraph,
-    ProjectSummary, RecentProject, Recents, SettingNode, UpdateResult, WorkspaceView,
+    Completion, FixedNode, LeanStatus, LogicGraph, NodeDetail, PreviewResult, Project,
+    ProjectGraph, ProjectSummary, RecentProject, Recents, SettingNode, UpdateResult,
+    WorkspaceView,
 };
 
 /// Holds the currently open project and the recently opened list. One workspace
@@ -726,6 +727,25 @@ pub fn lean_goals(
 ) -> Result<Goals, String> {
     with_project(&state, |project| {
         project.lean_goals(&id, line, character).map_err(message)
+    })
+}
+
+/// How the warm-up before the welcome page stands.
+#[tauri::command]
+pub fn startup_state() -> crate::lean::startup::StartupState {
+    crate::lean::startup::snapshot()
+}
+
+/// What Lean offers to complete at a position in a node's text.
+#[tauri::command(async)]
+pub fn lean_completions(
+    state: State<'_, AppState>,
+    id: String,
+    line: u32,
+    character: u32,
+) -> Result<Vec<Completion>, String> {
+    with_project(&state, |project| {
+        project.lean_completions(&id, line, character).map_err(message)
     })
 }
 

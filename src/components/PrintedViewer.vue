@@ -3,7 +3,7 @@
 import { computed } from "vue";
 import type { Printed } from "../store/workspace";
 import UiButton from "./ui/UiButton.vue";
-import UiCodeEditor from "./ui/UiCodeEditor.vue";
+import CodeEditor from "./ui/CodeEditor.vue";
 import UiIcon from "./ui/UiIcon.vue";
 
 const props = defineProps<{ printed: Printed | null }>();
@@ -25,7 +25,7 @@ const lines = computed(() => props.printed?.text.split("\n").length ?? 0);
       </UiButton>
     </div>
     <div class="printed__body">
-      <UiCodeEditor :model-value="printed.text" language="lean" readonly />
+      <CodeEditor :model-value="printed.text" :doc-id="printed.title" language="lean" readonly />
     </div>
   </div>
 </template>
