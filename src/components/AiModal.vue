@@ -6,12 +6,20 @@
 // while a model answers. Every entry except the model's own output folds away
 // behind a one-line preview, so a long session stays readable.
 import { computed, nextTick, ref, watch } from "vue";
-import type { ContextEntry, Entry, McpEntry, OutputEntry, Session } from "../api/ai";
+import type {
+  ContextEntry,
+  DiffEntry,
+  Entry,
+  McpEntry,
+  NodeChange,
+  OutputEntry,
+  Session,
+} from "../api/ai";
+import { changedLines, sideBySide } from "../lib/diff";
 import hljs from "../lib/highlight";
 import { aiActions, aiState } from "../store/ai";
 import ContextGraph from "./ContextGraph.vue";
 import MarkdownView from "./MarkdownView.vue";
-import MermaidDiagram from "./MermaidDiagram.vue";
 import UiButton from "./ui/UiButton.vue";
 import UiIcon from "./ui/UiIcon.vue";
 import UiSpinner from "./ui/UiSpinner.vue";
@@ -47,9 +55,8 @@ function isOpen(entry: Entry): boolean {
   const choice = folded.value[entry.id];
   if (choice !== undefined) return !choice;
   if (entry.type === "input") return true;
-  // A diagram is a picture: showing its source (or a collapsed row) is not the
-  // point, and drawing it is also what tells the model whether it was valid.
-  return entry.type === "mcp" && entry.tool === "diagram";
+  // A diff is the change the model just made to the project: it opens unfolded.
+  return entry.type === "diff";
 }
 
 function toggle(entry: Entry) {
@@ -94,8 +101,18 @@ function toolSummary(entry: McpEntry): string {
       const names = Array.isArray(input.names) ? input.names : [];
       return names.length ? names.join(", ") : "no names";
     }
-    case "diagram":
-      return firstLine(String(input.mermaid ?? "")) || "a diagram";
+    case "focus": {
+      const nodes = Array.isArray(input.nodes) ? input.nodes : [];
+      const target = String(input.target ?? "").trim();
+      const parts = [`${nodes.length} node(s)`];
+      if (target) parts.push(`target ${target}`);
+      return parts.join(" · ");
+    }
+    case "modify_ast": {
+      const action = String(input.action ?? "").trim() || "?";
+      const named = String(input.node ?? input.file ?? "").trim();
+      return named ? `${action} ${named}` : action;
+    }
     case "ask":
     case "ask_multi": {
       const options = Array.isArray(input.options) ? input.options : [];
@@ -112,7 +129,31 @@ function preview(entry: Entry): string {
   if (entry.type === "context") return firstLine(entry.text) || entry.label;
   if (entry.type === "input") return entry.text;
   if (entry.type === "mcp") return toolSummary(entry);
+  if (entry.type === "diff") {
+    const count = entry.changes.length;
+    return `${count} declaration${count === 1 ? "" : "s"} changed`;
+  }
   return "";
+}
+
+/** The rows of one changed declaration, aligned for the two columns. */
+function diffRows(change: NodeChange) {
+  return sideBySide(change.before, change.after);
+}
+
+/** `+3 −1` for one changed declaration. */
+function diffTally(change: NodeChange): string {
+  const { added, removed } = changedLines(diffRows(change));
+  return `${added > 0 ? `+${added}` : ""}${removed > 0 ? ` −${removed}` : ""}`.trim();
+}
+
+/** What happened to a declaration, in one word. */
+function changeWord(change: NodeChange): string {
+  return change.change === "added"
+    ? "added"
+    : change.change === "removed"
+      ? "removed"
+      : "edited";
 }
 
 /** The full arguments of a tool call, one row per key. */
@@ -121,18 +162,6 @@ function inputRows(entry: McpEntry): { key: string; value: string }[] {
     key,
     value: typeof value === "string" ? value : JSON.stringify(value, null, 2),
   }));
-}
-
-/**
- * The mermaid a `diagram` call asked for. It comes from the call's own arguments:
- * the tool *result* is the sentence the model reads ("the diagram is on screen"),
- * which mermaid cannot draw — that is what used to send the sentence to the
- * renderer and fail.
- */
-function diagramSource(entry: McpEntry): string {
-  if (entry.source) return entry.source;
-  const source = parseInput(entry).mermaid;
-  return typeof source === "string" ? source : "";
 }
 
 /** Options picked so far, per `ask_multi` entry. */
@@ -216,6 +245,14 @@ async function newSession() {
   await aiActions.start("free", used === 0 ? "new session" : `new session ${used + 1}`, []);
 }
 
+/** The modal's subtitle: the tab's title, and the term it focuses on. */
+const subtitle = computed(() => {
+  const session = active.value;
+  if (!session) return "no session yet";
+  if (!session.target) return session.title;
+  return `${session.title} · focus ${session.target.name}`;
+});
+
 // Keep the newest entry in view while text streams in.
 watch(
   () => active.value?.entries.length ?? 0,
@@ -231,7 +268,8 @@ watch(
   <UiModal
     :open="aiState.open"
     title="AI"
-    :subtitle="active?.title ?? 'no session yet'"
+    :subtitle="subtitle"
+    :badge="active?.target ? `∀ ${active.target.name}` : ''"
     :width="860"
     :height="640"
     :resizable="true"
@@ -408,13 +446,7 @@ watch(
                 </div>
               </div>
 
-              <MermaidDiagram
-                v-if="entry.tool === 'diagram' && diagramSource(entry)"
-                :source="diagramSource(entry)"
-                report
-                @drawn="(error) => aiActions.diagram(entry.id, error)"
-              />
-              <pre v-else-if="entry.result" class="ai-entry__result k-mono">{{ entry.result }}</pre>
+              <pre v-if="entry.result" class="ai-entry__result k-mono">{{ entry.result }}</pre>
 
               <!-- A question the model asked, waiting for an answer. -->
               <div v-if="entry.state === 'waiting'" class="ai-entry__ask">
@@ -438,6 +470,43 @@ watch(
                     send
                   </UiButton>
                 </div>
+              </div>
+            </template>
+          </div>
+
+          <!-- What `modify_ast` changed in this prompt: the old text beside the new. -->
+          <div v-else-if="entry.type === 'diff'" class="ai-entry ai-entry--diff">
+            <button class="ai-entry__head" type="button" @click="toggle(entry)">
+              <span class="ai-entry__tool k-mono">changed</span>
+              <span class="ai-entry__preview k-mono">{{ preview(entry) }}</span>
+              <UiIcon :name="isOpen(entry) ? 'chevron-down' : 'chevron'" :size="10" />
+            </button>
+
+            <template v-if="isOpen(entry)">
+              <div v-for="change in (entry as DiffEntry).changes" :key="change.name + change.file" class="ai-diff">
+                <div class="ai-diff__head">
+                  <span class="ai-diff__change" :data-change="change.change">
+                    {{ changeWord(change) }}
+                  </span>
+                  <span class="ai-diff__name k-mono">{{ change.name }}</span>
+                  <span class="ai-diff__file k-mono">{{ change.file }}</span>
+                  <span class="k-spacer" />
+                  <span class="ai-diff__tally k-mono">{{ diffTally(change) }}</span>
+                </div>
+                <table class="ai-diff__grid k-mono">
+                  <tbody>
+                    <tr v-for="(row, index) in diffRows(change)" :key="index" :data-kind="row.kind">
+                      <td class="ai-diff__cell" :data-side="'left'">
+                        <span class="ai-diff__sign">{{ row.kind === 'remove' ? '−' : ' ' }}</span>
+                        <span class="ai-diff__text">{{ row.left ?? '' }}</span>
+                      </td>
+                      <td class="ai-diff__cell" :data-side="'right'">
+                        <span class="ai-diff__sign">{{ row.kind === 'add' ? '+' : ' ' }}</span>
+                        <span class="ai-diff__text">{{ row.right ?? '' }}</span>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
               </div>
             </template>
           </div>
@@ -624,6 +693,108 @@ watch(
 
 .ai-entry--mcp {
   border-left: 2px solid rgba(120, 200, 220, 0.35);
+}
+
+.ai-entry--diff {
+  border-left: 2px solid var(--warning);
+}
+
+/* One changed declaration: its name, then the two columns of its lines. */
+.ai-entry--diff {
+  padding-bottom: 6px;
+}
+
+.ai-diff {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-top: 3px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.ai-diff__head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 1px;
+}
+
+.ai-diff__change {
+  padding: 0 4px;
+  border-radius: 2px;
+  background: var(--line-soft);
+  color: var(--text-faint);
+  font-size: var(--fs-micro);
+  text-transform: lowercase;
+}
+
+.ai-diff__change[data-change="added"] {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.ai-diff__change[data-change="removed"] {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.ai-diff__change[data-change="edited"] {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.ai-diff__name {
+  color: var(--fg-1);
+  font-size: var(--fs-xs);
+}
+
+.ai-diff__file,
+.ai-diff__tally {
+  color: var(--text-ghost);
+  font-size: var(--fs-micro);
+}
+
+.ai-diff__grid {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: var(--fs-micro);
+  line-height: 1.5;
+}
+
+.ai-diff__cell {
+  width: 50%;
+  padding: 0 4px;
+  vertical-align: top;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.ai-diff__sign {
+  display: inline-block;
+  width: 8px;
+  color: var(--text-ghost);
+}
+
+.ai-diff__text {
+  color: var(--text-dim);
+}
+
+.ai-diff__cell[data-side="left"] {
+  border-right: 1px solid var(--line-soft);
+}
+
+tr[data-kind="remove"] .ai-diff__cell[data-side="left"] {
+  background: var(--danger-soft);
+}
+
+tr[data-kind="add"] .ai-diff__cell[data-side="right"] {
+  background: var(--ok-soft);
+}
+
+tr[data-kind="same"] .ai-diff__text {
+  color: var(--text-faint);
 }
 
 .ai-entry[data-kind="chain_of_thought"] {

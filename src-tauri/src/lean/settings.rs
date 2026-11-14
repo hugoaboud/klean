@@ -305,10 +305,16 @@ pub fn tree(values: &BTreeMap<String, String>) -> Vec<SettingNode> {
                 "Let the model pull more nodes into the context, by fully qualified name.",
             ),
             SettingNode::boolean(
-                "ai.tools.diagram",
-                "diagram",
-                tool_enabled("diagram"),
-                "Let the model show a mermaid diagram to the user.",
+                "ai.tools.focus",
+                "focus",
+                tool_enabled("focus"),
+                "Let the model replace the context with only the nodes it names, and set the term the session focuses on.",
+            ),
+            SettingNode::boolean(
+                "ai.tools.modify_ast",
+                "modify_ast",
+                tool_enabled("modify_ast"),
+                "Let the model add, edit or remove declarations — this writes to the project's files.",
             ),
             SettingNode::boolean(
                 "ai.tools.lean_check",

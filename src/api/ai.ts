@@ -58,14 +58,33 @@ export interface McpEntry {
   /** Options of an `ask`/`ask_multi` question. */
   options: string[];
   multi: boolean;
-  /**
-   * For `diagram`: the mermaid source as the model wrote it. The result carries a
-   * sentence for the model, so the drawing has to come from here.
-   */
-  source?: string | null;
 }
 
-export type Entry = ContextEntry | InputEntry | OutputEntry | McpEntry;
+/** A declaration the model changed through `modify_ast`. */
+export interface NodeChange {
+  /** The node id, as the project names it; empty for a change already undone. */
+  id: string;
+  /** Fully qualified name, or the label a new declaration was given. */
+  name: string;
+  file: string;
+  /** The Lean kind: `def`, `theorem`, … */
+  kind: string;
+  /** `added`, `edited` or `removed`. */
+  change: string;
+  /** The declaration before the change; empty for a new one. */
+  before: string;
+  /** The declaration after it; empty for a removed one. */
+  after: string;
+}
+
+/** What one prompt changed, added to the feed when the model stops. */
+export interface DiffEntry {
+  type: "diff";
+  id: string;
+  changes: NodeChange[];
+}
+
+export type Entry = ContextEntry | InputEntry | OutputEntry | McpEntry | DiffEntry;
 
 /** A question the model asked through `ask`, waiting for the user. */
 export interface Question {
@@ -73,6 +92,14 @@ export interface Question {
   prompt: string;
   options: string[];
   multi: boolean;
+}
+
+/** The declaration a session is focused on. */
+export interface Target {
+  /** The node id, when KLEAN could resolve it. */
+  id: string;
+  /** Fully qualified name: namespace plus name, as `view_ast` prints it. */
+  name: string;
 }
 
 export interface Session {
@@ -86,6 +113,8 @@ export interface Session {
   /** AST nodes this session carries as context. */
   nodes: string[];
   question: Question | null;
+  /** The declaration this session focuses on, if it was started for one. */
+  target: Target | null;
   /** Tokens used so far, when the provider reports them. */
   usage: Usage;
   /** What those tokens cost, in dollars; null when the model has no known price. */
@@ -99,15 +128,15 @@ export interface Usage {
 
 export const aiSessions = () => invoke<Session[]>("ai_sessions");
 
-export const aiOpen = (origin: string, title: string, nodes: string[]) =>
-  invoke<string>("ai_open", { origin, title, nodes });
+export const aiOpen = (
+  origin: string,
+  title: string,
+  nodes: string[],
+  target: Target | null = null,
+) => invoke<string>("ai_open", { origin, title, nodes, target });
 
 export const aiPrompt = (session: string, text: string) =>
   invoke<void>("ai_prompt", { session, text });
-
-/** Reports whether the board could draw a `diagram` call; `error` = mermaid's. */
-export const aiDiagram = (session: string, entry: string, error: string | null) =>
-  invoke<void>("ai_diagram", { session, entry, error });
 
 export const aiAnswer = (session: string, entry: string, answer: string) =>
   invoke<void>("ai_answer", { session, entry, answer });

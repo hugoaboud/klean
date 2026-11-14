@@ -120,6 +120,24 @@ pub struct Project {
     engine: Engine,
 }
 
+/// A declaration a model changed through `modify_ast`.
+///
+/// Both sides of the change are carried: the AI modal draws them as a side-by-side
+/// diff, and the tool's answer shows the model what its own edit reads like now.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NodeChange {
+    pub id: String,
+    /// Fully qualified name, or the label a new declaration was given.
+    pub name: String,
+    pub file: String,
+    /// The Lean kind: `def`, `theorem`, …
+    pub kind: String,
+    /// `added`, `edited` or `removed`.
+    pub change: String,
+    pub before: String,
+    pub after: String,
+}
+
 impl Project {
     // ------------------------------------------------------------- lifecycle
 
@@ -1720,6 +1738,16 @@ impl Project {
         Ok(out)
     }
 
+    /// The fully qualified name of a node, as `view_ast` prints it: namespace plus
+    /// name. `None` when the id is not a declaration of the project.
+    pub fn ai_qualified_name(&mut self, id: &str) -> LeanResult<Option<String>> {
+        let (terms, _) = self.ai_catalog()?;
+        Ok(terms
+            .iter()
+            .find(|term| term.id == id)
+            .map(|term| term.qual.clone()))
+    }
+
     /// Resolves the names a model asked for through `expand`.
     pub fn ai_expand(&mut self, names: &[String]) -> LeanResult<(Vec<String>, Vec<String>)> {
         let (terms, _) = self.ai_catalog()?;
@@ -1731,6 +1759,18 @@ impl Project {
                 .iter()
                 .find(|term| term.qual == wanted)
                 .or_else(|| terms.iter().find(|term| term.label == wanted))
+                // A model that read the file's module name writes `Demo.Basic.two`
+                // or `Demo.two`; Lean's own name for it is `two`, so the module
+                // prefix is accepted and dropped.
+                .or_else(|| {
+                    terms.iter().find(|term| {
+                        let module = module_of(&term.path);
+                        wanted
+                            .strip_prefix(module.as_str())
+                            .and_then(|rest| rest.strip_prefix('.'))
+                            .is_some_and(|rest| rest == term.qual || rest == term.label)
+                    })
+                })
             {
                 Some(term) => {
                     if !ids.contains(&term.id) {
@@ -1919,6 +1959,176 @@ impl Project {
             }
         };
         self.fs.read(&rel)
+    }
+
+    // ------------------------------------------------------------ AI node edits
+
+    /// Resolves what a model called a declaration to a node id.
+    ///
+    /// `view_ast` prints fully qualified names, so that is what a model has to
+    /// work with — but a node id is accepted too, because that is what the rest of
+    /// KLEAN hands around.
+    pub fn ai_node_id(&mut self, name: &str) -> LeanResult<String> {
+        let wanted = name.trim();
+        if wanted.is_empty() {
+            return Err(LeanError::msg("name the declaration"));
+        }
+        if let Ok(target) = self.resolve(wanted) {
+            if matches!(target, Target::Ast { .. }) {
+                return Ok(wanted.to_string());
+            }
+        }
+        let (ids, _) = self.ai_expand(&[wanted.to_string()])?;
+        ids.into_iter()
+            .next()
+            .ok_or_else(|| LeanError::msg(format!("no declaration called `{wanted}`")))
+    }
+
+    /// Replaces a declaration's source, the way an editor's save does: the file is
+    /// written, the tree is re-read, and both sides of the change come back.
+    pub fn edit_node(&mut self, name: &str, text: &str) -> LeanResult<NodeChange> {
+        let id = self.ai_node_id(name)?;
+        let before = self.detail(&id)?;
+        if !before.editable {
+            return Err(LeanError::msg(format!("`{name}` cannot be edited")));
+        }
+        let saved = self.update(&id, text, &[])?;
+        Ok(NodeChange {
+            id: id.clone(),
+            name: saved
+                .detail
+                .name
+                .clone()
+                .unwrap_or_else(|| before.label.clone()),
+            file: before.path.clone().unwrap_or_default(),
+            kind: saved.detail.kind.clone(),
+            change: "edited".to_string(),
+            before: before.text,
+            after: saved.text,
+        })
+    }
+
+    /// Removes a declaration from the file it lives in.
+    pub fn remove_node(&mut self, name: &str) -> LeanResult<NodeChange> {
+        let id = self.ai_node_id(name)?;
+        let before = self.detail(&id)?;
+        self.delete_node(&id)?;
+        Ok(NodeChange {
+            id,
+            name: before.name.clone().unwrap_or_else(|| before.label.clone()),
+            file: before.path.clone().unwrap_or_default(),
+            kind: before.kind.clone(),
+            change: "removed".to_string(),
+            before: before.text,
+            after: String::new(),
+        })
+    }
+
+    /// Writes a new declaration into a file, after `after` when one is named.
+    ///
+    /// Without an anchor the declaration goes after the file's **last** declaration
+    /// at any depth, which is what keeps it inside a trailing `namespace … end`.
+    pub fn add_node(
+        &mut self,
+        file: &str,
+        text: &str,
+        after: Option<&str>,
+    ) -> LeanResult<NodeChange> {
+        let rel = file.trim().trim_start_matches('/').to_string();
+        if rel.is_empty() {
+            return Err(LeanError::msg("name the file the declaration goes in"));
+        }
+        if !self.fs.exists(&rel) {
+            return Err(LeanError::msg(format!("`{rel}` does not exist")));
+        }
+        let source = self.fs.read(&rel)?;
+
+        // Where it goes: after the anchor's text, or after the file's last
+        // declaration, so an add to a namespaced file stays in the namespace.
+        let anchor_id = match after {
+            Some(name) => Some(self.ai_node_id(name)?),
+            None => None,
+        };
+        let insert_at = match anchor_id.as_deref() {
+            Some(id) => match self.resolve(id)? {
+                Target::Ast { rel: anchor_rel, path } if anchor_rel == rel => {
+                    let cached = self.load(&rel, Parse::Tree)?;
+                    let node = cached.parsed.get(&path).ok_or_else(|| node_missing(id))?;
+                    node.span.end as usize
+                }
+                Target::Ast { rel: anchor_rel, .. } => {
+                    return Err(LeanError::msg(format!(
+                        "`{after:?}` is in {anchor_rel}, not {rel}"
+                    )));
+                }
+                _ => return Err(LeanError::msg("`after` must name a declaration")),
+            },
+            None => {
+                let cached = self.load(&rel, Parse::Tree)?;
+                let mut found = Vec::new();
+                term_nodes(&cached.parsed.nodes, "", &[], &rel, &mut found);
+                match found.last() {
+                    // The end of a declaration's *inner* span: the new text lands
+                    // before the `end` of the namespace it is written in.
+                    Some(last) => (last.span.end as usize).min(source.len()),
+                    None => source.len(),
+                }
+            }
+        };
+
+        let head = &source[..insert_at];
+        let tail = &source[insert_at..];
+        let lead = if head.is_empty() || head.ends_with("\n\n") {
+            ""
+        } else if head.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        // Whether the anchor sat inside a namespace is not known here, so the
+        // snippet keeps the indentation of the line it lands after.
+        let body = text.trim_end();
+        let trail = if tail.starts_with('\n') { "" } else { "\n" };
+        let next = format!("{head}{lead}{body}\n{trail}{tail}");
+        self.fs.write(&rel, &next)?;
+        self.cache.remove(&rel);
+        self.rescan()?;
+
+        // The new node is the one whose text starts inside the snippet that was
+        // written: a declaration's inner span begins after its keyword.
+        let start = (head.len() + lead.len()) as u32;
+        let end = start + body.len() as u32 + 1;
+        let id = match self.load(&rel, Parse::Tree) {
+            Ok(cached) => {
+                let mut found = Vec::new();
+                term_nodes(&cached.parsed.nodes, "", &[], &rel, &mut found);
+                found
+                    .into_iter()
+                    .find(|node| node.span.start >= start && node.span.start < end)
+                    .map(|node| node.id)
+                    .unwrap_or_default()
+            }
+            Err(_) => String::new(),
+        };
+        let detail = if id.is_empty() {
+            None
+        } else {
+            self.detail(&id).ok()
+        };
+        Ok(NodeChange {
+            id,
+            name: detail
+                .as_ref()
+                .and_then(|detail| detail.name.clone().or(Some(detail.label.clone())))
+                .unwrap_or_else(|| "the new declaration".to_string()),
+            file: rel,
+            kind: detail
+                .map(|detail| detail.kind)
+                .unwrap_or_else(|| "declaration".to_string()),
+            change: "added".to_string(),
+            before: String::new(),
+            after: body.to_string(),
+        })
     }
 
     /// Deletes a theory: its terms go back to unassigned, the theories nested in
@@ -2878,6 +3088,82 @@ theorem todo : two = 3 := by sorry
         )
         .expect("module");
         root
+    }
+
+    /// A file opened for the AI's edits: the project, without needing Lean.
+    fn editable(name: &str) -> (Project, std::path::PathBuf) {
+        let root = scratch(name);
+        let mut project =
+            Project::open(&root, std::env::temp_dir().join("klean-test-appdata")).expect("project");
+        project.view().expect("view");
+        (project, root)
+    }
+
+    /// `modify_ast` `edit` writes the file and reports both sides of the change.
+    #[test]
+    fn a_model_edit_replaces_the_declaration_it_names() {
+        let (mut project, root) = editable("ai-edit");
+        let change = project
+            .edit_node("two", "def two : Nat := 41")
+            .expect("edit");
+        assert_eq!(change.change, "edited");
+        assert_eq!(change.name, "two");
+        assert_eq!(change.file, "Demo/Basic.lean");
+        assert!(change.before.starts_with("def two : Nat := 2"), "{}", change.before);
+        assert_eq!(change.after.trim_end(), "def two : Nat := 41");
+        let source = std::fs::read_to_string(root.join("Demo/Basic.lean")).expect("file");
+        assert!(source.contains("def two : Nat := 41"), "{source}");
+        // The rest of the file is where it was.
+        assert!(source.contains("theorem t : two = 2 := rfl"), "{source}");
+        assert!(source.contains("theorem todo"), "{source}");
+        // An unknown name is an error, not a silent no-op.
+        assert!(project.edit_node("nope", "def nope : Nat := 0").is_err());
+        // A model that prefixes the module name still finds the declaration.
+        let again = project
+            .edit_node("Demo.Basic.two", "def two : Nat := 7")
+            .expect("edit by module-qualified name");
+        assert_eq!(again.change, "edited");
+        assert_eq!(again.after.trim_end(), "def two : Nat := 7");
+    }
+
+    /// `remove` takes the declaration and the blank lines around it.
+    #[test]
+    fn a_model_removal_cuts_the_declaration_out() {
+        let (mut project, root) = editable("ai-remove");
+        let change = project.remove_node("todo").expect("remove");
+        assert_eq!(change.change, "removed");
+        assert_eq!(change.after, "");
+        assert!(change.before.contains("theorem todo"), "{}", change.before);
+        let source = std::fs::read_to_string(root.join("Demo/Basic.lean")).expect("file");
+        assert!(!source.contains("theorem todo"), "{source}");
+        assert!(source.contains("theorem t : two = 2 := rfl"), "{source}");
+    }
+
+    /// `add` writes the snippet where it was asked to, and the new node can be
+    /// addressed afterwards like any other.
+    #[test]
+    fn a_model_addition_lands_after_the_declaration_it_names() {
+        let (mut project, root) = editable("ai-add");
+        let change = project
+            .add_node("Demo/Basic.lean", "def three : Nat := 3", Some("two"))
+            .expect("add");
+        assert_eq!(change.change, "added");
+        assert_eq!(change.name, "three");
+        let source = std::fs::read_to_string(root.join("Demo/Basic.lean")).expect("file");
+        let added = source.find("def three : Nat := 3").expect("written");
+        assert!(added > source.find("def two : Nat := 2").expect("two"), "{source}");
+        assert!(added < source.find("theorem t").expect("t"), "{source}");
+        // Without an anchor it goes at the end of the file.
+        project
+            .add_node("Demo/Basic.lean", "def four : Nat := 4", None)
+            .expect("add at the end");
+        let source = std::fs::read_to_string(root.join("Demo/Basic.lean")).expect("file");
+        assert!(
+            source.find("def four").expect("four") > source.find("theorem todo").expect("todo"),
+            "{source}"
+        );
+        // A file that does not exist is an error, not a new file nobody can import.
+        assert!(project.add_node("Demo/Nope.lean", "def x : Nat := 0", None).is_err());
     }
 
     /// Waits for the language server to finish the project, so the diagnostics

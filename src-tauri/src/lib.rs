@@ -92,7 +92,6 @@ pub fn run() {
             commands::ai_open,
             commands::ai_prompt,
             commands::ai_answer,
-            commands::ai_diagram,
             commands::ai_close,
             commands::ai_ready,
         ])

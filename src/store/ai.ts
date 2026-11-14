@@ -88,10 +88,19 @@ export const aiActions = {
     aiState.active = id;
   },
 
-  /** Opens a session seeded with nodes and shows it; this is what every AI request does first. */
-  async start(origin: string, title: string, nodes: string[]): Promise<string | null> {
+  /**
+   * Opens a session seeded with nodes and shows it; this is what every AI request
+   * does first. `target` is the declaration it is about, when the user started it
+   * from an editor: every context the session sends is introduced with it.
+   */
+  async start(
+    origin: string,
+    title: string,
+    nodes: string[],
+    target: ai.Target | null = null,
+  ): Promise<string | null> {
     try {
-      const id = await ai.aiOpen(origin, title, nodes);
+      const id = await ai.aiOpen(origin, title, nodes, target);
       aiState.active = id;
       aiState.open = true;
       aiState.error = null;
@@ -126,20 +135,6 @@ export const aiActions = {
       kick();
     } catch (error) {
       aiState.error = error instanceof Error ? error.message : String(error);
-    }
-  },
-
-  /**
-   * Reports how a `diagram` tool call went: the modal draws it, and mermaid's
-   * complaint goes back to the model, which may try again.
-   */
-  async diagram(entry: string, error: string | null): Promise<void> {
-    const id = aiState.active;
-    if (!id) return;
-    try {
-      await ai.aiDiagram(id, entry, error);
-    } catch {
-      // The turn may already have moved on; the feed says why in that case.
     }
   },
 

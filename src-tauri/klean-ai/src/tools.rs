@@ -1,10 +1,10 @@
 //! The tools a model may call while it answers.
 //!
 //! They are MCP tools in shape — a name, a description and a JSON schema — but
-//! KLEAN runs them itself: `view_ast`, `expand` and `lean_check` read the project,
-//! `ask` asks the user, `diagram` shows a mermaid picture. The session loop executes them and
-//! feeds the result back to the model, which is what lets a model look at more of
-//! the project only when it needs to.
+//! KLEAN runs them itself: `view_ast`, `expand`, `focus` and `lean_check` read the
+//! project, `modify_ast` writes to it, `ask` asks the user. The session loop
+//! executes them and feeds the result back to the model, which is what lets a model
+//! look at more of the project only when it needs to.
 
 use serde_json::{json, Value};
 
@@ -54,14 +54,34 @@ pub fn catalog() -> Vec<ToolSpec> {
             asks_user: false,
         },
         ToolSpec {
-            name: "diagram",
-            description: text::DIAGRAM,
+            name: "focus",
+            description: text::FOCUS,
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "mermaid": { "type": "string", "description": param::MERMAID }
+                    "nodes": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": param::FOCUS_NODES
+                    },
+                    "target": { "type": "string", "description": param::TARGET }
+                }
+            }),
+            asks_user: false,
+        },
+        ToolSpec {
+            name: "modify_ast",
+            description: text::MODIFY_AST,
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "description": param::ACTION },
+                    "node": { "type": "string", "description": param::NODE },
+                    "file": { "type": "string", "description": param::FILE },
+                    "text": { "type": "string", "description": param::TEXT },
+                    "after": { "type": "string", "description": param::AFTER }
                 },
-                "required": ["mermaid"]
+                "required": ["action"]
             }),
             asks_user: false,
         },
@@ -211,12 +231,16 @@ mod tests {
             vec![
                 "view_ast",
                 "expand",
-                "diagram",
+                "focus",
+                "modify_ast",
                 "lean_check",
                 "ask",
                 "ask_multi"
             ]
         );
+        // A picture is Markdown's job: a mermaid fence in the answer is drawn for
+        // the user, so no tool has to hand it one.
+        assert!(!names().contains(&"diagram"));
         // `lean_check` reaches Lean itself, so it must not be mistaken for a
         // question to the user.
         let tools = catalog();
@@ -264,9 +288,9 @@ mod tests {
     fn tools_follow_the_settings() {
         let config = ProviderConfig::default();
         let all = enabled_tools(&config, &[]);
-        assert_eq!(all.len(), 6);
-        let some = enabled_tools(&config, &["ai.tools.diagram".to_string()]);
+        assert_eq!(all.len(), 7);
+        let some = enabled_tools(&config, &["ai.tools.focus".to_string()]);
         assert_eq!(some.len(), 1);
-        assert_eq!(some[0].name, "diagram");
+        assert_eq!(some[0].name, "focus");
     }
 }

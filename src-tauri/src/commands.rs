@@ -833,14 +833,18 @@ pub fn ai_sessions(state: State<'_, AppState>) -> Result<Vec<klean_ai::Session>,
 }
 
 /// Opens a session seeded with nodes, and returns its id.
+///
+/// `target` is the declaration the session is about, when the user started it from
+/// an editor: every context the session sends is introduced with it.
 #[tauri::command(async)]
 pub fn ai_open(
     state: State<'_, AppState>,
     origin: String,
     title: String,
     nodes: Vec<String>,
+    target: Option<klean_ai::model::Target>,
 ) -> Result<String, String> {
-    state.ai().open(&origin, &title, nodes)
+    state.ai().open(&origin, &title, nodes, target)
 }
 
 /// Sends a prompt: KLEAN's context first, then the words.
@@ -862,18 +866,6 @@ pub fn ai_answer(
     answer: String,
 ) -> Result<(), String> {
     state.ai().answer(&session, &entry, &answer)
-}
-
-/// The board's verdict on a `diagram` tool call: `error` is mermaid's complaint when
-/// it could not draw, `null` when it drew.
-#[tauri::command(async)]
-pub fn ai_diagram(
-    state: State<'_, AppState>,
-    session: String,
-    entry: String,
-    error: Option<String>,
-) -> Result<(), String> {
-    state.ai().diagram(&session, &entry, error)
 }
 
 /// Closes a session, discarding its feed.

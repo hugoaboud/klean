@@ -215,11 +215,37 @@ pub enum Entry {
         options: Vec<String>,
         /// True when several options may be picked.
         multi: bool,
-        /// For `diagram`: the mermaid source as the model wrote it, kept apart
-        /// from the result so the modal can draw it without parsing prose.
-        #[serde(default)]
-        source: Option<String>,
     },
+    /// Declarations the model changed through `modify_ast` during one prompt.
+    ///
+    /// It is added when the model stops, not when the tool runs, so a turn that
+    /// edits four declarations shows one list rather than four entries in the middle
+    /// of the conversation.
+    Diff {
+        id: String,
+        changes: Vec<NodeChange>,
+    },
+}
+
+/// One declaration the model changed, with the text on both sides of the change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeChange {
+    /// The node id, as the project names it.
+    #[serde(default)]
+    pub id: String,
+    /// Fully qualified name, or the label a new declaration was given.
+    pub name: String,
+    /// The file it lives in, relative to the project.
+    pub file: String,
+    /// The Lean kind: `def`, `theorem`, `axiom`, …
+    #[serde(default)]
+    pub kind: String,
+    /// What happened: `added`, `edited` or `removed`.
+    pub change: String,
+    /// The declaration before the change; empty for a new one.
+    pub before: String,
+    /// The declaration after it; empty for a removed one.
+    pub after: String,
 }
 
 /// The three kinds of model output the feed shows differently.
@@ -252,7 +278,8 @@ impl Entry {
             Entry::Context { id, .. }
             | Entry::Input { id, .. }
             | Entry::Output { id, .. }
-            | Entry::Mcp { id, .. } => id,
+            | Entry::Mcp { id, .. }
+            | Entry::Diff { id, .. } => id,
         }
     }
 }
@@ -273,16 +300,26 @@ pub struct Session {
     pub nodes: Vec<String>,
     /// Set while an `ask`/`ask_multi` tool is waiting for the user.
     pub question: Option<Question>,
-    /// Diagrams the user's board refused to draw in this session, for the retry
-    /// budget: a model that keeps sending broken mermaid is told when to stop.
+    /// The declaration this session focuses on, when it was started for one — or
+    /// when `focus` set it. Every context sent to the model is introduced with it.
     #[serde(default)]
-    pub diagram_failures: u32,
+    pub target: Option<Target>,
     /// Tokens this session has used, when the provider reports them.
     #[serde(default)]
     pub usage: Usage,
     /// What those tokens cost, in dollars: `None` when the model has no price.
     #[serde(default)]
     pub cost_usd: Option<f64>,
+}
+
+/// The declaration a session is focused on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Target {
+    /// The node id, when KLEAN could resolve it; empty when only the name is known.
+    #[serde(default)]
+    pub id: String,
+    /// Fully qualified name: namespace plus name, the way `view_ast` prints it.
+    pub name: String,
 }
 
 /// A question the model asked through the `ask` tool.

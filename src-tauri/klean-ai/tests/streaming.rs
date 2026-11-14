@@ -280,7 +280,7 @@ fn a_session_runs_a_tool_and_asks_again() {
     config.api_key = "sk-test".to_string();
     ai.configure(config, tools::catalog());
 
-    let id = ai.open("editor", "theorem t", vec!["ast:Demo.lean#2".to_string()]);
+    let id = ai.open("editor", "theorem t", vec!["ast:Demo.lean#2".to_string()], None);
     ai.prompt(&id, "what does this theorem mean?").expect("prompt");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -301,6 +301,7 @@ fn a_session_runs_a_tool_and_asks_again() {
                         klean_ai::OutputKind::Markdown => "markdown",
                     },
                     Entry::Mcp { .. } => "mcp",
+                    Entry::Diff { .. } => "diff",
                 })
                 .collect();
             assert_eq!(kinds, vec!["input", "context", "mcp", "text"], "{kinds:?}");
@@ -345,202 +346,6 @@ fn tool_call_body(id: &str, name: &str, arguments: serde_json::Value) -> String 
     format!("data: {call}\n\ndata: {finish}\n\ndata: [DONE]\n\n")
 }
 
-/// Waits for a `diagram` entry to be waiting, and answers it with `error`.
-fn report_diagram(ai: &Arc<Ai>, id: &str, error: Option<&str>, times: usize) -> Vec<String> {
-    let mut reported = Vec::new();
-    for _ in 0..times {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let session = ai.session(id).expect("session");
-            let waiting = session.entries.iter().find_map(|entry| match entry {
-                Entry::Mcp { id, tool, state, .. }
-                    if tool == "diagram"
-                        && *state == klean_ai::McpState::Running
-                        && !reported.contains(id) =>
-                {
-                    Some(id.clone())
-                }
-                _ => None,
-            });
-            if let Some(entry) = waiting {
-                ai.diagram_result(id, &entry, error.map(str::to_string))
-                    .expect("report");
-                // Wait for the turn to take the verdict before looking again: the
-                // same entry must not be judged twice.
-                let settled = std::time::Instant::now() + Duration::from_secs(30);
-                loop {
-                    let session = ai.session(id).expect("session");
-                    let running = session.entries.iter().any(|item| {
-                        matches!(item, Entry::Mcp { id, state, .. }
-                            if id == &entry && *state == klean_ai::McpState::Running)
-                    });
-                    if !running {
-                        break;
-                    }
-                    assert!(std::time::Instant::now() < settled, "the verdict was ignored");
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                reported.push(entry);
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "no diagram was drawn");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-    reported
-}
-
-/// A diagram the board cannot draw goes back to the model, which may retry — and
-/// the picture is drawn from the model's own source, not from the sentence it reads.
-#[test]
-fn a_diagram_that_cannot_be_drawn_is_reported_and_retried() {
-    let call = tool_call_body(
-        "call_d",
-        "diagram",
-        serde_json::json!({ "mermaid": "graph LR\n  H -.->|fn (bad)| B" }),
-    );
-    let answer = concat!(
-        "data: {\"choices\":[{\"delta\":{\"content\":\"Drawn.\"}}]}\n\n",
-        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-        "data: [DONE]\n\n",
-    );
-    let retry = tool_call_body(
-        "call_d2",
-        "diagram",
-        serde_json::json!({ "mermaid": "graph LR\n  H -.->|\"fn (bad)\"| B" }),
-    );
-    let model = fake_model(vec![call, retry, answer.to_string()]);
-
-    let ai = Arc::new(Ai::new(Arc::new(RecordingHost {
-        seen_expand: Arc::new(Mutex::new(Vec::new())),
-    })));
-    let mut config = ProviderConfig::default();
-    config.base_url = model.base_url.clone();
-    config.api_key = "sk-test".to_string();
-    ai.configure(config, tools::catalog());
-    let id = ai.open("editor", "theorem t", Vec::new());
-    ai.prompt(&id, "draw the shape").expect("prompt");
-
-    // First attempt: the board refuses it, with mermaid's own complaint.
-    let complaint = "Parse error on line 2: Expecting 'PIPE', got 'PS'";
-    let reported = report_diagram(&ai, &id, Some(complaint), 1);
-    assert_eq!(reported.len(), 1);
-    // Second attempt: this time it draws.
-    report_diagram(&ai, &id, None, 1);
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let session = loop {
-        let session = ai.session(&id).expect("session");
-        if !session.running {
-            break session;
-        }
-        assert!(std::time::Instant::now() < deadline, "the session hung");
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    assert!(session.error.is_none(), "{:?}", session.error);
-
-    let diagrams: Vec<&Entry> = session
-        .entries
-        .iter()
-        .filter(|entry| matches!(entry, Entry::Mcp { tool, .. } if tool == "diagram"))
-        .collect();
-    assert_eq!(diagrams.len(), 2, "the retry was made");
-    // The source travels with the call, so the board can draw it rather than the
-    // sentence the model reads.
-    assert!(matches!(
-        diagrams[0],
-        Entry::Mcp { source: Some(source), state: klean_ai::McpState::Failed, .. }
-            if source.contains("graph LR")
-    ));
-    assert!(matches!(
-        diagrams[1],
-        Entry::Mcp { source: Some(_), state: klean_ai::McpState::Ok, result: Some(result), .. }
-            if result.contains("on screen")
-    ));
-
-    // The model was told what mermaid said, and given the retry.
-    let seen = model.seen.lock().unwrap();
-    let after_failure = seen[1]["messages"]
-        .as_array()
-        .expect("messages")
-        .iter()
-        .filter(|message| message["role"] == "tool")
-        .filter_map(|message| message["content"].as_str())
-        .any(|content| content.contains(complaint) && content.contains("call `diagram` again"));
-    assert!(after_failure, "the failure reaches the model: {:?}", seen[1]["messages"]);
-}
-
-/// The retry budget is spent: no more waiting on the board.
-#[test]
-fn diagrams_stop_after_the_retry_budget() {
-    let answer = concat!(
-        "data: {\"choices\":[{\"delta\":{\"content\":\"No picture then.\"}}]}\n\n",
-        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-        "data: [DONE]\n\n",
-    );
-    // Four calls: the first three are drawn (and refused), the fourth is refused
-    // without a drawing at all.
-    let bodies: Vec<String> = (0..4)
-        .map(|round| {
-            tool_call_body(
-                &format!("call_b{round}"),
-                "diagram",
-                serde_json::json!({ "mermaid": "graph LR\n  A-->B" }),
-            )
-        })
-        .collect();
-    let model = fake_model(vec![
-        bodies[0].clone(),
-        bodies[1].clone(),
-        bodies[2].clone(),
-        bodies[3].clone(),
-        answer.to_string(),
-    ]);
-
-    let ai = Arc::new(Ai::new(Arc::new(RecordingHost {
-        seen_expand: Arc::new(Mutex::new(Vec::new())),
-    })));
-    let mut config = ProviderConfig::default();
-    config.base_url = model.base_url.clone();
-    config.api_key = "sk-test".to_string();
-    ai.configure(config, tools::catalog());
-    let id = ai.open("editor", "theorem t", Vec::new());
-    ai.prompt(&id, "draw the shape").expect("prompt");
-
-    report_diagram(&ai, &id, Some("Parse error"), klean_ai::store::DIAGRAM_RETRIES as usize);
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let session = loop {
-        let session = ai.session(&id).expect("session");
-        if !session.running {
-            break session;
-        }
-        assert!(std::time::Instant::now() < deadline, "the session hung");
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let diagrams = session
-        .entries
-        .iter()
-        .filter(|entry| matches!(entry, Entry::Mcp { tool, .. } if tool == "diagram"))
-        .count();
-    assert_eq!(diagrams, 4, "every call is still recorded");
-    assert_eq!(session.diagram_failures as u32, klean_ai::store::DIAGRAM_RETRIES);
-    // The last call is answered without a drawing: it says the budget is spent.
-    let seen = model.seen.lock().unwrap();
-    let gave_up = seen
-        .last()
-        .and_then(|body| body["messages"].as_array())
-        .map(|messages| {
-            messages
-                .iter()
-                .filter(|message| message["role"] == "tool")
-                .filter_map(|message| message["content"].as_str())
-                .any(|content| content.contains("No more attempts at a diagram"))
-        })
-        .unwrap_or(false);
-    assert!(gave_up, "the model is told to stop: {:?}", seen.last());
-}
-
 /// The user's own instructions are **appended** to the built-in prompt: the model
 /// still gets KLEAN's rules, and the customisation is marked as the user's.
 #[test]
@@ -559,7 +364,7 @@ fn a_custom_system_prompt_is_appended_to_the_built_in_one() {
     config.api_key = "sk-test".to_string();
     ai.configure(config, tools::catalog());
     ai.customize("Answer in French, and never use `sorry`.");
-    let id = ai.open("free", "new session", Vec::new());
+    let id = ai.open("free", "new session", Vec::new(), None);
     ai.prompt(&id, "hi").expect("prompt");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -578,23 +383,25 @@ fn a_custom_system_prompt_is_appended_to_the_built_in_one() {
         .expect("a system message")
         .to_string();
     // Both halves are there, and the built-in one comes first.
-    assert!(system.contains("KLEAN's assistant"), "{system}");
+    let built_in = klean_ai::prompts::SYSTEM.trim();
+    assert!(system.starts_with(built_in), "{system}");
     assert!(system.contains("Answer in French, and never use `sorry`."), "{system}");
     assert!(
-        system.find("KLEAN's assistant") < system.find("Answer in French"),
+        system.find(built_in).unwrap_or(usize::MAX)
+            < system.find("Answer in French").unwrap_or(0),
         "the custom prompt is appended, not substituted: {system}"
     );
     // With nothing customised, the prompt is exactly the built-in one.
     let plain = Arc::new(Ai::new(Arc::new(RecordingHost {
         seen_expand: Arc::new(Mutex::new(Vec::new())),
     })));
-    assert!(plain.system_prompt().contains("KLEAN's assistant"));
+    assert!(plain.system_prompt().starts_with(klean_ai::prompts::SYSTEM.trim()));
     assert!(!plain.system_prompt().contains(prompts_marker()));
 }
 
-/// A string that only appears when something was customised.
+/// The line that only appears when something was customised.
 fn prompts_marker() -> &'static str {
-    "Additional instructions from the user"
+    klean_ai::prompts::CUSTOM_INTRO
 }
 
 /// `lean_check` reaches the host, and Lean's answer goes back to the model.
@@ -641,7 +448,7 @@ fn lean_check_answers_with_leans_own_output() {
     config.api_key = "sk-test".to_string();
     ai.configure(config, tools::catalog());
     // A session with no context at all: the tool is how the model finds out anything.
-    let id = ai.open("free", "new session", Vec::new());
+    let id = ai.open("free", "new session", Vec::new(), None);
     ai.prompt(&id, "what is two?").expect("prompt");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -715,7 +522,7 @@ fn token_usage_reaches_the_session() {
     config.max_tokens = 32;
     ai.configure(config, tools::catalog());
 
-    let id = ai.open("editor", "usage", vec!["ast:Demo.lean#0".to_string()]);
+    let id = ai.open("editor", "usage", vec!["ast:Demo.lean#0".to_string()], None);
     ai.prompt(&id, "hi").expect("prompt");
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
@@ -770,4 +577,221 @@ fn claude_reports_usage_at_both_ends() {
     .expect("stream");
     assert_eq!(usage.input_tokens, 800);
     assert_eq!(usage.output_tokens, 250);
+}
+
+/// A host that records what `modify_ast` asked it to do, and answers the way the
+/// project does: both sides of the change, and the file it happened in.
+struct EditingHost {
+    edits: Arc<Mutex<Vec<String>>>,
+}
+
+impl Host for EditingHost {
+    fn view_ast(&self, _input: &Value) -> Result<String, String> {
+        Ok("def Demo.two : Nat := 2".to_string())
+    }
+    fn expand(&self, _known: &[String], _names: &[String]) -> Result<Expanded, String> {
+        Ok(Expanded {
+            nodes: vec!["ast:Demo.lean#1".to_string()],
+            missing: Vec::new(),
+            context: ContextText {
+                text: "def foo : Nat := 1".to_string(),
+                graph: ContextGraph::default(),
+            },
+        })
+    }
+    fn context(&self, _nodes: &[String]) -> Result<ContextText, String> {
+        Ok(ContextText {
+            text: "def foo : Nat := 1".to_string(),
+            graph: ContextGraph::default(),
+        })
+    }
+    fn resolve_name(&self, name: &str) -> Option<String> {
+        Some(format!("ast:{name}"))
+    }
+    fn edit_node(&self, name: &str, text: &str) -> Result<klean_ai::model::NodeChange, String> {
+        self.edits.lock().unwrap().push(format!("edit {name}"));
+        Ok(klean_ai::model::NodeChange {
+            id: "ast:Demo.lean#1".to_string(),
+            name: name.to_string(),
+            file: "Demo/Basic.lean".to_string(),
+            kind: "def".to_string(),
+            change: "edited".to_string(),
+            before: "def two : Nat := 2".to_string(),
+            after: text.to_string(),
+        })
+    }
+}
+
+/// Waits for a session to stop, and returns it.
+fn settled(ai: &Arc<Ai>, id: &str) -> klean_ai::Session {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let session = ai.session(id).expect("session");
+        if !session.running {
+            return session;
+        }
+        assert!(std::time::Instant::now() < deadline, "the session hung");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The answer-only body a model sends when it has nothing left to ask.
+fn an_answer(text: &str) -> String {
+    format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        serde_json::json!({ "choices": [{ "delta": { "content": text } }] }),
+        serde_json::json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] }),
+    )
+}
+
+/// A session opened for one declaration keeps saying so: the line goes out with
+/// every context, not only with the first prompt.
+#[test]
+fn a_targeted_session_names_its_term_in_front_of_every_context() {
+    let model = fake_model(vec![an_answer("It is two."), an_answer("Still two.")]);
+    let ai = Arc::new(Ai::new(Arc::new(RecordingHost {
+        seen_expand: Arc::new(Mutex::new(Vec::new())),
+    })));
+    let mut config = ProviderConfig::default();
+    config.base_url = model.base_url.clone();
+    config.api_key = "sk-test".to_string();
+    ai.configure(config, tools::catalog());
+
+    let id = ai.open(
+        "editor",
+        "theorem t",
+        vec!["ast:Demo.lean#2".to_string()],
+        Some(klean_ai::model::Target {
+            id: "ast:Demo.lean#2".to_string(),
+            name: "Demo.two".to_string(),
+        }),
+    );
+    ai.prompt(&id, "what is this?").expect("prompt");
+    settled(&ai, &id);
+    ai.prompt(&id, "and again?").expect("prompt");
+    let session = settled(&ai, &id);
+    assert!(session.error.is_none(), "{:?}", session.error);
+    assert_eq!(
+        session.target.as_ref().map(|target| target.name.as_str()),
+        Some("Demo.two")
+    );
+
+    let seen = model.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "two prompts, two requests");
+    for (index, request) in seen.iter().enumerate() {
+        let carries = request["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .any(|content| {
+                content.contains("Focus on term Demo.two. Use other terms as context.")
+                    && content.contains("LCONTEXT:")
+            });
+        assert!(carries, "request {index} says what to focus on: {request}");
+    }
+}
+
+/// `focus` replaces the context outright, and sets or clears the target.
+#[test]
+fn focus_replaces_the_context_and_sets_the_target() {
+    let focus = tool_call_body(
+        "call_f",
+        "focus",
+        serde_json::json!({ "nodes": ["Demo.foo"], "target": "Demo.foo" }),
+    );
+    let model = fake_model(vec![focus, an_answer("Narrowed.")]);
+    let ai = Arc::new(Ai::new(Arc::new(RecordingHost {
+        seen_expand: Arc::new(Mutex::new(Vec::new())),
+    })));
+    let mut config = ProviderConfig::default();
+    config.base_url = model.base_url.clone();
+    config.api_key = "sk-test".to_string();
+    ai.configure(config, tools::catalog());
+
+    let id = ai.open(
+        "editor",
+        "theorem t",
+        vec!["ast:Demo.lean#2".to_string(), "ast:Demo.lean#3".to_string()],
+        None,
+    );
+    ai.prompt(&id, "only foo matters").expect("prompt");
+    let session = settled(&ai, &id);
+    assert!(session.error.is_none(), "{:?}", session.error);
+    // The two nodes it had are gone; only what `focus` asked for is left.
+    assert_eq!(session.nodes, vec!["ast:Demo.lean#1".to_string()]);
+    assert_eq!(
+        session.target.as_ref().map(|target| target.name.as_str()),
+        Some("Demo.foo")
+    );
+    assert!(
+        session.entries.iter().any(|entry| matches!(
+            entry,
+            Entry::Mcp { tool, state: klean_ai::McpState::Ok, .. } if tool == "focus"
+        )),
+        "the call is in the feed"
+    );
+}
+
+/// `modify_ast` writes through the host, and once the model stops the feed shows
+/// what changed — one entry for the whole prompt, with both sides of each node.
+#[test]
+fn modify_ast_shows_a_diff_when_the_model_stops() {
+    let edit = tool_call_body(
+        "call_e",
+        "modify_ast",
+        serde_json::json!({
+            "action": "edit",
+            "node": "Demo.two",
+            "text": "def two : Nat := 3",
+        }),
+    );
+    let model = fake_model(vec![edit, an_answer("Changed it to 3.")]);
+    let edits = Arc::new(Mutex::new(Vec::new()));
+    let ai = Arc::new(Ai::new(Arc::new(EditingHost {
+        edits: Arc::clone(&edits),
+    })));
+    let mut config = ProviderConfig::default();
+    config.base_url = model.base_url.clone();
+    config.api_key = "sk-test".to_string();
+    ai.configure(config, tools::catalog());
+
+    let id = ai.open(
+        "editor",
+        "theorem t",
+        vec!["ast:Demo.lean#2".to_string()],
+        None,
+    );
+    ai.prompt(&id, "make it 3").expect("prompt");
+    let session = settled(&ai, &id);
+    assert!(session.error.is_none(), "{:?}", session.error);
+    assert_eq!(edits.lock().unwrap().as_slice(), ["edit Demo.two"]);
+
+    // The tool ran, and the model was told what its own edit now reads like.
+    assert!(
+        session.entries.iter().any(|entry| matches!(
+            entry,
+            Entry::Mcp { tool, state: klean_ai::McpState::Ok, result: Some(result), .. }
+                if tool == "modify_ast" && result.contains("def two : Nat := 3")
+        )),
+        "the call is in the feed: {:?}",
+        session.entries
+    );
+    // One diff entry, added when the model stopped, with both texts.
+    let diffs: Vec<&Entry> = session
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry, Entry::Diff { .. }))
+        .collect();
+    assert_eq!(diffs.len(), 1, "one diff for the prompt");
+    match diffs[0] {
+        Entry::Diff { changes, .. } => {
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].name, "Demo.two");
+            assert_eq!(changes[0].change, "edited");
+            assert_eq!(changes[0].before, "def two : Nat := 2");
+            assert_eq!(changes[0].after, "def two : Nat := 3");
+        }
+        _ => unreachable!(),
+    }
 }

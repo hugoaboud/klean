@@ -8,10 +8,10 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::lean::project::{AiContext, AiContextNode};
+use crate::lean::project::{AiContext, AiContextNode, NodeChange as ProjectChange};
 use crate::lean::{LeanResult, Project};
 use klean_ai::model::{ProviderConfig, ProviderKind, Session};
-use klean_ai::model::{ContextGraph, ContextNode};
+use klean_ai::model::{ContextGraph, ContextNode, NodeChange, Target};
 use klean_ai::store::{Ai, ContextText, Expanded, Host};
 use klean_ai::tools::{self, ToolSpec};
 
@@ -135,6 +135,36 @@ impl Host for ProjectHost {
         let plan = self.with(|project| project.check_plan())?;
         crate::lean::check::run(plan, expression)
     }
+
+    /// `modify_ast` `edit`: the project writes the file the way a save does, so
+    /// every open editor sees the change on its next read.
+    fn edit_node(&self, name: &str, text: &str) -> Result<NodeChange, String> {
+        let change = self.with(|project| project.edit_node(name, text))?;
+        Ok(convert_change(change))
+    }
+
+    fn remove_node(&self, name: &str) -> Result<NodeChange, String> {
+        let change = self.with(|project| project.remove_node(name))?;
+        Ok(convert_change(change))
+    }
+
+    fn add_node(&self, file: &str, text: &str, after: Option<&str>) -> Result<NodeChange, String> {
+        let change = self.with(|project| project.add_node(file, text, after))?;
+        Ok(convert_change(change))
+    }
+}
+
+/// A change the project made, in the library's terms.
+fn convert_change(change: ProjectChange) -> NodeChange {
+    NodeChange {
+        id: change.id,
+        name: change.name,
+        file: change.file,
+        kind: change.kind,
+        change: change.change,
+        before: change.before,
+        after: change.after,
+    }
 }
 
 /// The project's context, in the library's terms.
@@ -205,11 +235,36 @@ impl AiRuntime {
         self.ai.sessions()
     }
 
-    pub fn open(&self, origin: &str, title: &str, nodes: Vec<String>) -> Result<String, String> {
+    /// Opens a session. `target` is the declaration it is about, when the user
+    /// started it from one — the modal sends the node's place and its full name.
+    pub fn open(
+        &self,
+        origin: &str,
+        title: &str,
+        nodes: Vec<String>,
+        target: Option<Target>,
+    ) -> Result<String, String> {
         if !self.settings().enabled {
             return Err("AI features are switched off in Settings → AI".to_string());
         }
-        Ok(self.ai.open(origin, title, nodes))
+        // The model is told *which term* to focus on, so the name has to be the
+        // qualified one — the namespace is what makes it unambiguous. The caller
+        // only knows where the node is, so it is read here.
+        let target = target.map(|target| {
+            let qualified = self
+                .host
+                .with(|project| project.ai_qualified_name(&target.id))
+                .ok()
+                .flatten();
+            match qualified {
+                Some(name) => Target {
+                    id: target.id,
+                    name,
+                },
+                None => target,
+            }
+        });
+        Ok(self.ai.open(origin, title, nodes, target))
     }
 
     pub fn prompt(&self, session: &str, text: &str) -> Result<(), String> {
@@ -228,16 +283,6 @@ impl AiRuntime {
         self.ai.answer(session, entry, answer)
     }
 
-    /// Whether the board could draw a diagram the model asked for.
-    pub fn diagram(
-        &self,
-        session: &str,
-        entry: &str,
-        error: Option<String>,
-    ) -> Result<(), String> {
-        self.ai.diagram_result(session, entry, error)
-    }
-
     pub fn close(&self, session: &str) {
         self.ai.close(session);
     }
@@ -253,7 +298,7 @@ mod tests {
         values.insert("ai.enabled".to_string(), "true".to_string());
         values.insert("ai.model.type".to_string(), "Claude".to_string());
         values.insert("ai.model.api_key".to_string(), "sk-ant".to_string());
-        values.insert("ai.tools.diagram".to_string(), "false".to_string());
+        values.insert("ai.tools.focus".to_string(), "false".to_string());
         let settings = AiSettings::read(&values);
         assert!(settings.enabled);
         assert_eq!(settings.config.kind, ProviderKind::Claude);
@@ -261,8 +306,8 @@ mod tests {
         // The model defaults to the provider's own.
         assert_eq!(settings.config.model, ProviderKind::Claude.default_model());
         let tools = settings.tool_specs();
-        assert_eq!(tools.len(), 5, "diagram is switched off");
-        assert!(tools.iter().all(|tool| tool.name != "diagram"));
+        assert_eq!(tools.len(), 6, "focus is switched off");
+        assert!(tools.iter().all(|tool| tool.name != "focus"));
     }
 
     /// The user's own instructions are read as written — several lines included —

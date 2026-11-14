@@ -82,12 +82,20 @@ function pickFromGraph(id: string, additive: boolean) {
   else void actions.select(id);
 }
 
-/** The editor's prompt: an AI session seeded with the node being edited. */
+/**
+ * The editor's prompt: an AI session seeded with the node being edited, and
+ * *targeted* at it — every context the session sends says which term it is about.
+ * Rust fills in the qualified name; the label here is only a fallback.
+ */
 async function askAboutNode(text: string) {
   const detail = activePane()?.detail ?? null;
   if (!detail) return;
   const title = detail.name ?? detail.label;
-  const id = await aiActions.start("editor", title, [detail.id]);
+  // A file is not a term: only a declaration becomes the session's target.
+  const target = detail.id.startsWith("ast:")
+    ? { id: detail.id, name: detail.name ?? "" }
+    : null;
+  const id = await aiActions.start("editor", title, [detail.id], target);
   if (id) await aiActions.send(text, id);
 }
 

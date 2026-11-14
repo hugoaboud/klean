@@ -8,9 +8,13 @@
 /// The opening message of every session.
 pub const SYSTEM: &str = "This is a Lean4 project, your goal is to assist the user with it. \n\n\
 - Before every prompt you'll be given a working Lean4 file with a subset of terms from the main project, called LCONTEXT. \
-- If you need a bigger subset, tool `view_ast` allows you to look around and tool `expand` allows adding \
-other nodes to LCONTEXT (dependee nodes are also added, no need to ask for them). \
-- Answer in Markdown. If a diagram helps describing a concept, the tool `diagram` can be used. \
+- If you need a bigger subset, tool `view_ast` allows you to look around, tool `expand` adds \
+other nodes to LCONTEXT (dependee nodes are also added, no need to ask for them), and tool `focus` \
+replaces LCONTEXT with only the nodes you name. \
+- Tool `modify_ast` adds, edits or removes declarations of the project. Its changes are written to \
+the project's files, so make them only when the user asked for a change. \
+- Answer in Markdown. A diagram helps more often than prose: write it as a mermaid fence \
+(```mermaid) in your answer and it is drawn next to what you wrote. \
 - Don't assume anything beyond what's deducible from LCONTEXT, there's no limit for the `ask` and `ask_multi` tools. \
 - You MUST only answer based on the axioms of LCONTEXT, nothing else. Short and concise answers. \
 - Non-trivial answers require using the tool `lean_check` to validate hypothesis. \
@@ -25,6 +29,16 @@ pub const CONTEXT_INTRO: &str = "LCONTEXT:";
 
 /// What `expand` says back when it brought nodes in.
 pub const EXPAND_INTRO: &str = "LCONTEXT expanded with new nodes:";
+
+/// What `focus` says back when it replaced the whole context.
+pub const FOCUS_INTRO: &str = "LCONTEXT replaced with these nodes:";
+
+/// The line a session that was started for one declaration puts before the context
+/// — every time the context is sent, not only at the start, so a long session does
+/// not drift away from the term it was opened for.
+pub fn target_intro(name: &str) -> String {
+    format!("Focus on term {name}. Use other terms as context.")
+}
 
 // ------------------------------------------------------- tool results (text the model reads)
 
@@ -41,35 +55,6 @@ pub fn tool_failed(reason: &str) -> String {
 /// A tool KLEAN knows but has no implementation for.
 pub fn not_implemented(name: &str) -> String {
     format!("The tool `{name}` is not implemented")
-}
-
-/// The result of `diagram` when the picture was drawn. The model only needs to know
-/// it worked; the source stays in KLEAN (it is what the board draws).
-pub fn diagram_shown() -> String {
-    "The diagram is now on screen.".to_string()
-}
-
-/// The result of `diagram` when the board could not draw it.
-///
-/// The error is mermaid's own complaint, which names the line and the token it
-/// wanted — that is what lets the model fix the syntax instead of guessing.
-pub fn diagram_failed(attempt: u32, left: u32, error: &str) -> String {
-    format!(
-        "Could not draw that diagram; this was attempt {attempt}. Mermaid reported:\n\n\
-         ```\n{error}\n```\n\n\
-         Fix the syntax and call `diagram` again — {left} retr{} left. Quoting an edge label \
-         (`A -->|\"text with punctuation (or arrows)\"| B`) is usually what is missing. If the \
-         next attempt fails too, carry on without the picture.",
-        if left == 1 { "y" } else { "ies" },
-    )
-}
-
-/// The result of `diagram` once the retry budget is spent.
-pub fn diagram_abandoned(retries: u32) -> String {
-    format!(
-        "No more attempts at a diagram: {retries} retries were already spent on diagrams \
-         mermaid could not draw. Answer in words instead."
-    )
 }
 
 /// The result of `lean_check` when Lean had nothing to say about the term.
@@ -93,6 +78,40 @@ pub fn expanded(added: usize, missing: &[String], context: &str) -> String {
     text
 }
 
+/// The result of `focus`: the new context, and the target the session now has.
+pub fn focused(
+    count: usize,
+    missing: &[String],
+    target: Option<&str>,
+    context: &str,
+) -> String {
+    let mut text = format!("The context is now these {count} declaration(s)");
+    if !missing.is_empty() {
+        text.push_str(&format!(". Not found: {}", missing.join(", ")));
+    }
+    text.push('.');
+    text.push_str(&format!(
+        "\n\n{}",
+        match target {
+            Some(name) => target_intro(name),
+            None => "There is no target term.".to_string(),
+        }
+    ));
+    text.push_str(&format!("\n\n{FOCUS_INTRO}\n\n```lean\n{context}\n```"));
+    text
+}
+
+/// The result of `modify_ast`, once the change is on disk.
+///
+/// The whole declaration as it now reads is included: the model has to be able to
+/// see what its change did to the file, not be told that it worked.
+pub fn modified(action: &str, name: &str, file: &str, text: &str) -> String {
+    if action == "remove" {
+        return format!("Removed `{name}` from {file}.");
+    }
+    format!("{action} `{name}` in {file}. It now reads:\n\n```lean\n{text}\n```")
+}
+
 /// The result of an `ask` the user never answered.
 pub const NO_ANSWER: &str = "The user did not answer.";
 
@@ -101,18 +120,25 @@ pub const NO_ANSWER: &str = "The user did not answer.";
 /// Descriptions shown to the model for each tool.
 pub mod tool {
     pub const VIEW_AST: &str = "\
-Show the project's syntax tree as text, so you can find declarations to expand. \
-Returns one line per declaration: kind, fully qualified name, file and signature. \
-Use `query` to filter by name, namespace or file path.";
+Show the project's syntax tree as text, so you can find declarations to expand, or the names \
+`modify_ast` takes. Returns one line per declaration: kind, fully qualified name, file and \
+signature. Use `query` to filter by name, namespace or file path.";
 
     pub const EXPAND: &str = "\
 Add declarations to this session's context by their fully qualified name (namespace plus \
 name, for example `Demo.foo`). Returns the new context, which includes the added \
 declarations and everything they depend on.";
 
-    pub const DIAGRAM: &str = "\
-Show the user a mermaid diagram. Use it to explain structure, a proof plan or a shape of \
-data. The diagram is drawn next to your answer.";
+    pub const FOCUS: &str = "\
+Replace this session's context with only the declarations you name — plus everything they \
+depend on — and drop the rest. Use it to stop carrying a context that has grown too wide. \
+Passing `target` also sets the term the session focuses on (an empty string clears it).";
+
+    pub const MODIFY_AST: &str = "\
+Change the project's declarations. `action` is `add`, `edit` or `remove`. `edit` and `remove` \
+take the fully qualified name of an existing declaration (as `view_ast` lists it); `add` takes \
+the file to write to and the new Lean source, and `after` to place it right after an existing \
+declaration (`Demo.foo`) instead of at the end of the file. The file is written immediately.";
 
     pub const LEAN_CHECK: &str = "\
 Ask Lean for the type of an expression, with the whole project in scope — every module the \
@@ -134,7 +160,13 @@ pub mod param {
     pub const QUERY: &str = "Filter: part of a name, a namespace, or a file path. Empty lists the most important declarations.";
     pub const DEPTH: &str = "How deep to indent the listing (default 1).";
     pub const NAMES: &str = "Fully qualified names to add, e.g. [\"Demo.foo\", \"Demo.bar\"].";
-    pub const MERMAID: &str = "The mermaid source, e.g. `graph TD; A-->B`.";
+    pub const FOCUS_NODES: &str = "The only declarations the context should hold, by fully qualified name, e.g. [\"Demo.foo\"].";
+    pub const TARGET: &str = "The declaration this session focuses on, by fully qualified name. An empty string clears the target.";
+    pub const ACTION: &str = "What to do: `add`, `edit` or `remove`.";
+    pub const NODE: &str = "Fully qualified name of the declaration to edit or remove, e.g. `Demo.foo`.";
+    pub const FILE: &str = "File to write the new declaration to, e.g. `Demo/Basic.lean`.";
+    pub const TEXT: &str = "The declaration's new Lean source, exactly as it should be written to the file.";
+    pub const AFTER: &str = "Fully qualified name of the declaration the new one goes right after. Empty puts it at the end of the file.";
     pub const EXPRESSION: &str = "The Lean term to check, e.g. `Demo.foo` or `(fun x : Nat => x + 1)`.";
     pub const QUESTION: &str = "The question to ask the user.";
     pub const OPTIONS: &str = "The answers the user may pick from.";

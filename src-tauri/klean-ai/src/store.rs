@@ -15,8 +15,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::model::{
-    markdown_blocks, ContextGraph, Entry, McpState, Message, OutputKind, Part, ProviderConfig,
-    Question, Role, Session, Usage,
+    markdown_blocks, ContextGraph, Entry, McpState, Message, NodeChange, OutputKind, Part,
+    ProviderConfig, Question, Role, Session, Target, Usage,
 };
 use crate::prompts;
 use crate::provider::{self, Event};
@@ -48,6 +48,30 @@ pub trait Host: Send + Sync {
     fn lean_check(&self, _expression: &str) -> Result<String, String> {
         Err("this workspace cannot run Lean".to_string())
     }
+
+    /// `modify_ast` `edit`: replace a declaration's source, keeping its place.
+    ///
+    /// The default refuses, like `lean_check`: a host that cannot write a project
+    /// must say so rather than pretend the change happened.
+    fn edit_node(&self, _name: &str, _text: &str) -> Result<NodeChange, String> {
+        Err("this workspace cannot change the project".to_string())
+    }
+
+    /// `modify_ast` `remove`: delete a declaration from its file.
+    fn remove_node(&self, _name: &str) -> Result<NodeChange, String> {
+        Err("this workspace cannot change the project".to_string())
+    }
+
+    /// `modify_ast` `add`: write a new declaration into a file, after `after` when
+    /// one is named.
+    fn add_node(
+        &self,
+        _file: &str,
+        _text: &str,
+        _after: Option<&str>,
+    ) -> Result<NodeChange, String> {
+        Err("this workspace cannot change the project".to_string())
+    }
 }
 
 /// A reduced context: the Lean source, and the declarations it holds.
@@ -58,7 +82,7 @@ pub struct ContextText {
 }
 
 /// What `expand` did.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Expanded {
     /// Node ids that were added.
     pub nodes: Vec<String>,
@@ -68,22 +92,29 @@ pub struct Expanded {
     pub context: ContextText,
 }
 
+/// The string items of an array argument, for the tools that take a list of names.
+fn strings(input: &Value, key: &str) -> Vec<String> {
+    input
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The opening message of every session. The text lives in [`crate::prompts`].
 pub const SYSTEM_PROMPT: &str = prompts::SYSTEM;
 
-/// How many times a model may retry a diagram the board could not draw.
-///
-/// Mermaid's syntax is finicky (an unquoted edge label with punctuation fails), so
-/// one retry is not enough; a model that keeps failing has to be stopped, which is
-/// what the budget is for.
-pub const DIAGRAM_RETRIES: u32 = 3;
+/// How many model turns one prompt may take before it is cut off: each round is a
+/// set of tool calls, so this bounds a model that keeps looking around.
+const ROUNDS: usize = 8;
 
-/// How long the board has to draw a diagram and report back.
-///
-/// A render is fast (mermaid is already loaded by the time a second diagram
-/// arrives), so the budget is generous, not long. The modal may be closed, in which
-/// case nothing draws at all: waiting past a render would only stall the turn.
-const DIAGRAM_WAIT: Duration = Duration::from_secs(10);
+/// How long an `ask` waits for the user before the model is told nobody answered.
+const ANSWER_WAIT: Duration = Duration::from_secs(600);
 
 struct Inner {
     sessions: Vec<(Session, Conversation)>,
@@ -94,6 +125,9 @@ struct Inner {
 #[derive(Default)]
 struct Conversation {
     messages: Vec<Message>,
+    /// Declarations `modify_ast` changed during the prompt in flight, in the order
+    /// they were changed: the feed shows them as one diff once the model stops.
+    edits: Vec<NodeChange>,
 }
 
 /// Every session of this app run.
@@ -105,8 +139,6 @@ pub struct Ai {
     timeout: Duration,
     /// Where a waiting `ask` is answered from.
     answers: Arc<Mutex<Vec<(String, Sender<String>)>>>,
-    /// Where a `diagram` waiting to be drawn is judged: `None` means it drew.
-    drawings: Arc<Mutex<Vec<(String, Sender<Option<String>>)>>>,
     /// The user's own instructions, appended to [`SYSTEM_PROMPT`].
     custom: Arc<Mutex<String>>,
 }
@@ -123,7 +155,6 @@ impl Ai {
             tools: Arc::new(Mutex::new(tools::catalog())),
             timeout: Duration::from_secs(300),
             answers: Arc::new(Mutex::new(Vec::new())),
-            drawings: Arc::new(Mutex::new(Vec::new())),
             custom: Arc::new(Mutex::new(String::new())),
         }
     }
@@ -162,7 +193,16 @@ impl Ai {
     }
 
     /// Opens a session seeded with some nodes, and returns its id.
-    pub fn open(&self, origin: &str, title: &str, nodes: Vec<String>) -> String {
+    ///
+    /// `target` is the declaration the session is about, when it was started from
+    /// one: every context it sends is introduced with «focus on this term».
+    pub fn open(
+        &self,
+        origin: &str,
+        title: &str,
+        nodes: Vec<String>,
+        target: Option<Target>,
+    ) -> String {
         let mut inner = self.inner.lock().expect("sessions lock");
         let id = format!("ai-{}", inner.next_id);
         inner.next_id += 1;
@@ -179,7 +219,7 @@ impl Ai {
             error: None,
             nodes,
             question: None,
-            diagram_failures: 0,
+            target,
             usage: Usage::default(),
             cost_usd: Some(0.0),
         };
@@ -301,68 +341,17 @@ impl Ai {
             .map_err(|_| "the model stopped waiting".to_string())
     }
 
-    /// Reports whether the board could draw a diagram (`None` means it did).
-    ///
-    /// A late verdict — the turn already gave up waiting — still updates the entry,
-    /// so the feed shows the fallback and why it is there.
-    pub fn diagram_result(&self, id: &str, entry: &str, error: Option<String>) -> Result<(), String> {
-        let key = format!("{id}:{entry}");
-        let sender = {
-            let mut drawings = self.drawings.lock().expect("drawings lock");
-            match drawings.iter().position(|(held, _)| held == &key) {
-                Some(index) => drawings.remove(index).1,
-                None => {
-                    // Too late to answer. The entry may still be running (the wait
-                    // timed out), in which case the failure is worth recording — but
-                    // a verdict that arrives twice must not spend the budget twice.
-                    let recorded = self.finish_mcp_if_running(id, entry, McpState::Failed, error.as_deref().unwrap_or(""));
-                    if recorded && error.is_some() {
-                        let mut inner = self.inner.lock().expect("sessions lock");
-                        if let Some((session, _)) =
-                            inner.sessions.iter_mut().find(|(s, _)| s.id == id)
-                        {
-                            session.diagram_failures += 1;
-                        }
-                    }
-                    return Err("that diagram is no longer waiting".to_string());
-                }
-            }
-        };
-        sender
-            .send(error)
-            .map_err(|_| "the model stopped waiting".to_string())
-    }
-
-    /// Records the mermaid source of a `diagram` entry, so the board draws the
-    /// diagram itself rather than the sentence describing it.
-    fn set_entry_source(&self, id: &str, entry: &str, source: &str) {
+    /// Sets or clears the term a session focuses on, and returns what it became.
+    pub fn set_target(&self, id: &str, target: Option<Target>) -> Option<Target> {
         let mut inner = self.inner.lock().expect("sessions lock");
-        if let Some((session, _)) = inner.sessions.iter_mut().find(|(s, _)| s.id == id) {
-            if let Some(Entry::Mcp { source: held, .. }) =
-                session.entries.iter_mut().find(|item| item.id() == entry)
-            {
-                *held = Some(source.to_string());
-            }
-        }
-    }
-
-    /// How many diagrams this session has failed to draw.
-    fn diagram_failures(&self, id: &str) -> u32 {
-        self.inner
-            .lock()
-            .expect("sessions lock")
+        let session = inner
             .sessions
-            .iter()
+            .iter_mut()
             .find(|(session, _)| session.id == id)
-            .map(|(session, _)| session.diagram_failures)
-            .unwrap_or(0)
-    }
-
-    fn set_diagram_failures(&self, id: &str, failures: u32) {
-        let mut inner = self.inner.lock().expect("sessions lock");
-        if let Some((session, _)) = inner.sessions.iter_mut().find(|(s, _)| s.id == id) {
-            session.diagram_failures = failures;
-        }
+            .map(|(session, _)| session)
+            ?;
+        session.target = target;
+        session.target.clone()
     }
 
     // ---------------------------------------------------------------- running
@@ -381,7 +370,13 @@ impl Ai {
     }
 
     fn run_inner(&self, id: &str, text: &str, nodes: &[String]) -> Result<(), String> {
-        // 1. KLEAN's own context, as its own entry, before the prompt.
+        // 1. KLEAN's own context, as its own entry, before the prompt. What the
+        // previous prompt changed is already on screen, so this one starts clean.
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Some((_, conversation)) = inner.sessions.iter_mut().find(|(s, _)| s.id == id) {
+                conversation.edits.clear();
+            }
+        }
         let context = self
             .host
             .context(nodes)
@@ -402,9 +397,19 @@ impl Ai {
                 nodes: nodes.to_vec(),
                 graph: context.graph.clone(),
             });
+            // A session opened for one declaration says so every time the context
+            // goes out, so a long conversation does not drift away from it.
+            let target = session
+                .target
+                .as_ref()
+                .map(|target| format!("{}\n\n", prompts::target_intro(&target.name)))
+                .unwrap_or_default();
             conversation.messages.push(Message::text(
                 Role::User,
-                format!("{}\n\n```lean\n{context_text}\n```", prompts::CONTEXT_INTRO),
+                format!(
+                    "{target}{}\n\n```lean\n{context_text}\n```",
+                    prompts::CONTEXT_INTRO
+                ),
             ));
         }
         // The prompt goes to the model whether or not a context came with it: a
@@ -415,19 +420,41 @@ impl Ai {
         drop(inner);
 
         // 2. The turns, until the model stops asking for tools.
-        for _round in 0..8 {
+        for _round in 0..ROUNDS {
             let calls = self.run_turn(id)?;
             if calls.is_empty() {
                 break;
             }
         }
 
+        self.push_diffs(id);
         let mut inner = self.inner.lock().expect("sessions lock");
         if let Some((session, _)) = inner.sessions.iter_mut().find(|(s, _)| s.id == id) {
             session.running = false;
             session.question = None;
         }
         Ok(())
+    }
+
+    /// Shows what `modify_ast` changed during the prompt that just ended.
+    ///
+    /// One entry for the whole prompt, with one row per declaration: the user reads
+    /// what the model did to the project, in the place where it happened.
+    fn push_diffs(&self, id: &str) {
+        let mut inner = self.inner.lock().expect("sessions lock");
+        let Some((session, conversation)) = inner.sessions.iter_mut().find(|(s, _)| s.id == id)
+        else {
+            return;
+        };
+        let changes = std::mem::take(&mut conversation.edits);
+        if changes.is_empty() {
+            return;
+        }
+        let entry = format!("{id}-diff-{}", session.entries.len());
+        session.entries.push(Entry::Diff {
+            id: entry,
+            changes,
+        });
     }
 
     /// One model turn. Returns the tool calls it wants run.
@@ -633,22 +660,6 @@ impl Ai {
                 ..
             } => (question, options, multi),
             Call::Local { name, input } => {
-                // A model that has spent its diagram retries gets no more pictures:
-                // said plainly, and without waiting on a board that will not draw.
-                let failures = if name == "diagram" {
-                    self.diagram_failures(id)
-                } else {
-                    0
-                };
-                if name == "diagram" && failures >= DIAGRAM_RETRIES {
-                    self.add_mcp_entry(id, &entry_id, &name, &input.to_string(), Vec::new(), false);
-                    let message = prompts::diagram_abandoned(DIAGRAM_RETRIES);
-                    self.finish_mcp(id, &entry_id, McpState::Failed, &message);
-                    return Ok(message);
-                }
-                // `diagram` needs its verdict channel in place before the entry is
-                // in the feed: the board may draw the moment it appears.
-                let waiting = (name == "diagram").then(|| self.expect_drawing(id, &entry_id));
                 self.add_mcp_entry(id, &entry_id, &name, &input.to_string(), Vec::new(), false);
                 let result = match name.as_str() {
                     "view_ast" => self.host.view_ast(&input),
@@ -699,35 +710,129 @@ impl Ai {
                             Err(error) => Err(error),
                         }
                     }
-                    "diagram" => {
-                        let source = input
-                            .get("mermaid")
+                    "focus" => {
+                        // A missing `nodes` key means "leave the context alone and
+                        // only set the target"; an empty list means "empty it".
+                        let names = strings(&input, "nodes");
+                        let target = match input.get("target") {
+                            None => None,
+                            Some(value) => Some(value.as_str().unwrap_or("").trim().to_string()),
+                        };
+                        let expanded = match input.get("nodes") {
+                            None => self.host.context(&self.session_nodes(id)).map(|context| {
+                                Expanded {
+                                    nodes: self.session_nodes(id),
+                                    missing: Vec::new(),
+                                    context,
+                                }
+                            }),
+                            // An empty set of names is a context with nothing in it.
+                            Some(_) if names.is_empty() => Ok(Expanded::default()),
+                            Some(_) => self.host.expand(&[], &names),
+                        };
+                        match expanded {
+                            Ok(expanded) => {
+                                if input.get("nodes").is_some() {
+                                    self.replace_context(id, &expanded.nodes);
+                                }
+                                let target = match target {
+                                    Some(name) if name.is_empty() => {
+                                        self.set_target(id, None);
+                                        None
+                                    }
+                                    Some(name) => {
+                                        let id_of = self
+                                            .host
+                                            .resolve_name(&name)
+                                            .unwrap_or_default();
+                                        self.set_target(
+                                            id,
+                                            Some(Target {
+                                                id: id_of,
+                                                name: name.clone(),
+                                            }),
+                                        )
+                                        .map(|target| target.name)
+                                    }
+                                    None => self.session_target(id).map(|target| target.name),
+                                };
+                                Ok(prompts::focused(
+                                    expanded.nodes.len(),
+                                    &expanded.missing,
+                                    target.as_deref(),
+                                    &expanded.context.text,
+                                ))
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    "modify_ast" => {
+                        let action = input
+                            .get("action")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .trim()
+                            .to_lowercase();
+                        let node = input
+                            .get("node")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let text = input
+                            .get("text")
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string();
-                        self.set_entry_source(id, &entry_id, &source);
-                        match waiting.map(Self::drawn) {
-                            Some(Ok(())) => {
-                                self.set_diagram_failures(id, 0);
-                                Ok(prompts::diagram_shown())
+                        let changed = match action.as_str() {
+                            "edit" if node.is_empty() => {
+                                Err("`modify_ast` needs `node`: the declaration to edit".to_string())
                             }
-                            Some(Err(error)) => {
-                                self.finish_mcp(id, &entry_id, McpState::Failed, &error);
-                                let spent = failures + 1;
-                                self.set_diagram_failures(id, spent);
-                                if spent >= DIAGRAM_RETRIES {
-                                    Ok(prompts::diagram_abandoned(DIAGRAM_RETRIES))
+                            "edit" if text.trim().is_empty() => {
+                                Err("`modify_ast` needs `text`: the declaration's new source".to_string())
+                            }
+                            "edit" => self.host.edit_node(&node, &text),
+                            "remove" if node.is_empty() => {
+                                Err("`modify_ast` needs `node`: the declaration to remove".to_string())
+                            }
+                            "remove" => self.host.remove_node(&node),
+                            "add" => {
+                                let file = input
+                                    .get("file")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_string();
+                                let after = input
+                                    .get("after")
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|name| !name.is_empty())
+                                    .map(str::to_string);
+                                if file.is_empty() {
+                                    Err("`modify_ast` needs `file`: where the declaration goes".to_string())
+                                } else if text.trim().is_empty() {
+                                    Err("`modify_ast` needs `text`: the declaration's source".to_string())
                                 } else {
-                                    Ok(prompts::diagram_failed(
-                                        spent,
-                                        DIAGRAM_RETRIES - spent,
-                                        &error,
-                                    ))
+                                    self.host.add_node(&file, &text, after.as_deref())
                                 }
                             }
-                            // No channel: cannot happen, but a picture is not worth
-                            // failing a turn over.
-                            None => Ok(prompts::diagram_shown()),
+                            other => Err(format!(
+                                "`modify_ast` takes `add`, `edit` or `remove`, not `{other}`"
+                            )),
+                        };
+                        match changed {
+                            Ok(change) => {
+                                let answer = prompts::modified(
+                                    &change.change,
+                                    &change.name,
+                                    &change.file,
+                                    &change.after,
+                                );
+                                self.record_edit(id, change);
+                                Ok(answer)
+                            }
+                            Err(error) => Err(error),
                         }
                     }
                     other => Err(prompts::not_implemented(other)),
@@ -753,7 +858,7 @@ impl Ai {
             .lock()
             .expect("answers lock")
             .push((format!("{id}:{entry_id}"), sender));
-        let answer = match receiver.recv_timeout(Duration::from_secs(600)) {
+        let answer = match receiver.recv_timeout(ANSWER_WAIT) {
             Ok(answer) => answer,
             Err(_) => prompts::NO_ANSWER.to_string(),
         };
@@ -761,26 +866,54 @@ impl Ai {
         Ok(answer)
     }
 
-    /// Registers the channel a diagram's verdict will arrive on, before the entry
-    /// that the board reacts to exists.
-    fn expect_drawing(&self, id: &str, entry: &str) -> mpsc::Receiver<Option<String>> {
-        let (sender, receiver) = mpsc::channel();
-        self.drawings
+    /// The term a session is focused on, if any.
+    fn session_target(&self, id: &str) -> Option<Target> {
+        self.inner
             .lock()
-            .expect("drawings lock")
-            .push((format!("{id}:{entry}"), sender));
-        receiver
+            .expect("sessions lock")
+            .sessions
+            .iter()
+            .find(|(session, _)| session.id == id)
+            .and_then(|(session, _)| session.target.clone())
     }
 
-    /// Waits for the board to draw. `Ok` means it drew.
-    fn drawn(receiver: mpsc::Receiver<Option<String>>) -> Result<(), String> {
-        match receiver.recv_timeout(DIAGRAM_WAIT) {
-            // Drawn.
-            Ok(None) => Ok(()),
-            Ok(Some(error)) => Err(error),
-            // Nobody drew it: the modal may be closed. Nothing can be checked, so
-            // the turn goes on rather than stalling on a board that is not there.
-            Err(_) => Ok(()),
+    /// Replaces everything a session carries with these nodes, and records the
+    /// context they make. This is `focus`: it is how a session narrows again.
+    fn replace_context(&self, id: &str, nodes: &[String]) {
+        let context = {
+            let mut inner = self.inner.lock().expect("sessions lock");
+            let Some((session, _)) = inner.sessions.iter_mut().find(|(s, _)| s.id == id) else {
+                return;
+            };
+            session.nodes = nodes.to_vec();
+            drop(inner);
+            self.host.context(nodes).ok()
+        };
+        if let Some(context) = context {
+            self.push_context(id, &context);
+        }
+    }
+
+    /// Remembers a declaration `modify_ast` changed, for the diff the feed shows
+    /// when the model stops: the first `before` and the last `after` are the ones
+    /// that describe the prompt as a whole.
+    fn record_edit(&self, id: &str, change: NodeChange) {
+        let mut inner = self.inner.lock().expect("sessions lock");
+        if let Some((_, conversation)) = inner.sessions.iter_mut().find(|(s, _)| s.id == id) {
+            if let Some(held) = conversation
+                .edits
+                .iter_mut()
+                .find(|held| !change.id.is_empty() && held.id == change.id)
+            {
+                held.after = change.after;
+                held.name = change.name;
+                // An add followed by a remove of the same node never existed.
+                if held.change == "added" && change.change == "removed" {
+                    held.before = String::new();
+                }
+                return;
+            }
+            conversation.edits.push(change);
         }
     }
 
@@ -848,7 +981,6 @@ impl Ai {
                 result: None,
                 options,
                 multi,
-                source: None,
             });
         }
     }
@@ -879,8 +1011,7 @@ impl Ai {
         }
     }
 
-    /// Finishes an entry only if it is still running: a tool that reports its own
-    /// verdict (a diagram the board refused) keeps it.
+    /// Finishes an entry only if it is still running.
     fn finish_mcp_if_running(&self, id: &str, entry: &str, state: McpState, result: &str) -> bool {
         let mut inner = self.inner.lock().expect("sessions lock");
         if let Some((session, _)) = inner.sessions.iter_mut().find(|(s, _)| s.id == id) {
@@ -977,7 +1108,7 @@ mod tests {
     #[test]
     fn sessions_open_close_and_keep_their_nodes() {
         let ai = ai();
-        let id = ai.open("editor", "theorem t", vec!["ast:Demo.lean#1".to_string()]);
+        let id = ai.open("editor", "theorem t", vec!["ast:Demo.lean#1".to_string()], None);
         let sessions = ai.sessions();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].title, "theorem t");
@@ -991,7 +1122,7 @@ mod tests {
     #[test]
     fn a_prompt_needs_a_configured_model() {
         let ai = ai();
-        let id = ai.open("editor", "t", Vec::new());
+        let id = ai.open("editor", "t", Vec::new(), None);
         let error = ai.prompt(&id, "what is this?").unwrap_err();
         assert!(error.contains("not configured"), "{error}");
     }
@@ -1011,7 +1142,7 @@ mod tests {
             },
             tools::catalog(),
         );
-        let id = ai.open("editor", "t", vec!["ast:Demo.lean#0".to_string()]);
+        let id = ai.open("editor", "t", vec!["ast:Demo.lean#0".to_string()], None);
         ai.prompt(&id, "hello").expect("the worker starts");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
@@ -1038,7 +1169,7 @@ mod tests {
     #[test]
     fn ask_waits_for_the_user() {
         let ai = ai();
-        let id = ai.open("editor", "t", Vec::new());
+        let id = ai.open("editor", "t", Vec::new(), None);
         let entry = format!("{id}-mcp-call");
         ai.add_mcp_entry(&id, &entry, "ask", &json!({"question": "which?"}).to_string(), vec!["a".into(), "b".into()], false);
         ai.mark_waiting(&id, &entry, "which?", &["a".to_string(), "b".to_string()], false);

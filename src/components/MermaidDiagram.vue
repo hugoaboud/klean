@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// A mermaid diagram, drawn from the source a model wrote.
+// A mermaid diagram, drawn from a fence in the model's answer.
 //
 // Mermaid is loaded the first time a diagram appears (it is a large library, and
 // most sessions never draw one) and rendered to SVG. While the answer is still
@@ -12,23 +12,14 @@ const props = withDefaults(
     source: string;
     /** False while the text is still arriving. */
     done?: boolean;
-    /**
-     * Set for a `diagram` tool call: the result of drawing goes back to the model,
-     * which may retry. Diagrams inside an answer have no entry and are just drawn.
-     */
-    report?: boolean;
   }>(),
-  { done: true, report: false },
+  { done: true },
 );
-
-const emit = defineEmits<{ (event: "drawn", error: string | null): void }>();
 
 const svg = ref("");
 const error = ref<string | null>(null);
 const rendering = ref(false);
 let sequence = 0;
-/** The source last reported to the backend: a redraw must not judge it twice. */
-let judged: string | null = null;
 
 /** Mermaid needs a theme that matches the board, set once. */
 async function renderer() {
@@ -65,19 +56,11 @@ async function draw() {
     if (token !== sequence) return;
     svg.value = result.svg;
     error.value = null;
-    if (props.report && judged !== props.source) {
-      judged = props.source;
-      emit("drawn", null);
-    }
   } catch (failure) {
     if (token !== sequence) return;
     // A model can write a diagram that does not parse: show what it wrote.
     svg.value = "";
     error.value = failure instanceof Error ? failure.message : String(failure);
-    if (props.report && judged !== props.source) {
-      judged = props.source;
-      emit("drawn", error.value);
-    }
   } finally {
     if (token === sequence) rendering.value = false;
   }

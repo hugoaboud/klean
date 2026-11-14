@@ -328,17 +328,25 @@ writes the **reduced Lean source** for the request: the declaration, everything 
 and the imports those files declare. A model therefore sees a small compilable file rather
 than the project.
 
-Models can look further with the six tools KLEAN implements itself (`Settings → AI →
+Models can look further with the seven tools KLEAN implements itself (`Settings → AI →
 Tools` switches each one off or on):
 
 | tool | what it does |
 | --- | --- |
 | `view_ast` | lists the project's declarations as text, filtered by a query |
 | `expand` | pulls more nodes into the session's context, by fully qualified name |
+| `focus` | *replaces* the context with only the nodes it names (and their dependees), and sets or clears the session's target |
+| `modify_ast` | adds, edits or removes declarations — it writes the project's files |
 | `lean_check` | Lean's own `#check` for an expression, with the whole project in scope |
-| `diagram` | shows a mermaid diagram to the user |
 | `ask` | asks the user, with answers to pick from; the worker waits for the answer |
 | `ask_multi` | the same, allowing several answers |
+
+A session started from an editor is **targeted**: it was opened for one declaration, and every
+context it sends is introduced with *"Focus on term Demo.two. Use other terms as context."* —
+not only the first one, so a long conversation does not drift away from the term it was opened
+for. The name is the fully qualified one (KLEAN reads it from the project when the modal only
+knows the node id), since the namespace is what makes it unambiguous. `focus` sets or clears the
+same target mid-session, and the modal shows it beside the tab's title.
 
 `Settings → AI → Customize → System Prompt` appends your own instructions to KLEAN's built-in
 system prompt for every session — the built-in rules stay (a user shouldn't have to restate
@@ -357,11 +365,18 @@ built modules are imported, because one unbuilt import would end the check. The 
 outside the project lock, so the board stays usable while Lean thinks, and it is bounded by the
 *Lean → timeout* setting. Without build output the tool says so instead of guessing.
 
-A `diagram` call is drawn *before* the model is told it worked: the modal renders the call's own
-mermaid source and reports back whether it parsed. When it did not, mermaid's complaint goes to
-the model as the tool result and it may retry — up to three retries, after which `diagram` is
-refused and it is asked to answer in words. (The wire the model reads says "the diagram is on
-screen"; the picture comes from the call's `mermaid` argument, never from that sentence.)
+**There is no diagram tool.** The answer is Markdown, and a ```mermaid fence in it is drawn
+next to the text it belongs to — so the model has nothing to hand to anyone, nothing to retry,
+and a picture is written where it is read. What it *changes*, however, it does through
+`modify_ast`: `add` (with the file to write and, optionally, the declaration to land after),
+`edit` (replace a declaration, addressed by its fully qualified name) and `remove`. The project
+writes the file the way a save does, so the tree, the boards and every open editor see it, and
+the model is answered with the declaration as it now reads.
+
+When a prompt that called `modify_ast` ends, the feed gets one **diff entry**: every declaration
+the model touched during that prompt, side by side — what it was, what it is now, aligned line by
+line (`src/lib/diff.ts`, `npm test` covers it). It is one entry for the prompt rather than one
+per call, so a model that edits four declarations reads as a single change to the project.
 
 Every text a model is shown — the system prompt, each tool's description and parameters, the
 line that introduces the context, and each tool's result — lives in

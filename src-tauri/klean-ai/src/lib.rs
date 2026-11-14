@@ -6,6 +6,11 @@
 //! [`store::Host`]), the user's words, then the model's turn, including any tools
 //! it calls ([`tools`]).
 //!
+//! A session may be *targeted*: opened for one declaration, in which case every
+//! context it sends is introduced with the term to focus on. A picture is not a
+//! tool — the answer is Markdown, so a mermaid fence in it is drawn next to the
+//! text.
+//!
 //! Providers are the three shapes [`provider`] speaks: DeepSeek, Anthropic's
 //! Claude, and anything OpenAI-compatible. Streaming is plain blocking IO, which is
 //! why a session can be a thread instead of a task.
@@ -20,7 +25,7 @@
 //! #   fn resolve_name(&self, _: &str) -> Option<String> { None }
 //! # }
 //! let ai = Ai::new(std::sync::Arc::new(MyHost));
-//! let id = ai.open("editor", "theorem t", vec![]);
+//! let id = ai.open("editor", "theorem t", vec![], None);
 //! ```
 
 pub mod model;
